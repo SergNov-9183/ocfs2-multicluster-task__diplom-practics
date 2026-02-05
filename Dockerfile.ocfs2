@@ -1,0 +1,80 @@
+FROM debian:12
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV GIT_TERMINAL_PROMPT=0
+ENV GCM_INTERACTIVE=Never
+
+# Base utilities + build deps + ocfs2-tools deps (com_err/e2fs)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git curl wget \
+    build-essential gcc make \
+    autoconf automake libtool pkg-config \
+    bison flex \
+    python3 python3-pip \
+    kmod iproute2 iputils-ping net-tools util-linux \
+    drbd-utils \
+    ocfs2-tools \
+    ocfs2-tools-dev \
+    lcov \
+    comerr-dev e2fslibs-dev uuid-dev libblkid-dev \
+    libdevmapper-dev libaio-dev libncurses5-dev \
+    libpam0g-dev \
+    libreadline-dev \
+    libglib2.0-dev \
+    xfsprogs \
+    acl attr \
+; \
+    rm -rf /var/lib/apt/lists/*
+
+# Установка xfstests (если доступен в репозиториях или компиляция из исходников)
+RUN set -eux; \
+    if apt-cache search xfstests | grep -q xfstests; then \
+        apt-get update && apt-get install -y xfstests || true; \
+    fi; \
+    if [ ! -d /opt/xfstests ] && [ ! -f /usr/bin/xfstests ] && [ ! -f /usr/share/xfstests/check ]; then \
+        cd /opt; \
+        (git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git xfstests 2>/dev/null) || \
+        (git clone --depth 1 https://github.com/tytso/xfstests.git xfstests 2>/dev/null) || \
+        echo "xfstests не установлен, будет использован только кастомный набор тестов"; \
+        if [ -d xfstests ]; then \
+            cd xfstests; \
+            make 2>/dev/null || echo "Не удалось скомпилировать xfstests"; \
+        fi; \
+    fi
+
+RUN mkdir -p /etc/ocfs2 /etc/drbd.d /mnt/ocfs2 /tmp/gcov_reports /opt
+
+COPY setup_drbd.sh /setup_drbd.sh
+COPY setup_ocfs2_cluster.sh /setup_ocfs2_cluster.sh
+COPY run_tests.sh /run_tests.sh
+COPY collect_kernel_gcov.sh /collect_kernel_gcov.sh
+COPY collect_tools_gcov.sh /collect_tools_gcov.sh
+COPY merge_tools_gcov.sh /merge_tools_gcov.sh
+
+RUN chmod +x /setup_drbd.sh /setup_ocfs2_cluster.sh /run_tests.sh /collect_kernel_gcov.sh /collect_tools_gcov.sh /merge_tools_gcov.sh
+
+# Build ocfs2-tools from sources with coverage and install to /opt/ocfs2-tools-cov
+RUN set -eux; \
+    cd /opt; \
+    rm -rf ocfs2-tools-src ocfs2-tools-cov; \
+    (git clone --depth 1 https://github.com/ocfs2/ocfs2-tools.git ocfs2-tools-src) || \
+    (git clone --depth 1 https://github.com/markfasheh/ocfs2-tools.git ocfs2-tools-src); \
+    cd /opt/ocfs2-tools-src; \
+    if [ -x ./autogen.sh ]; then \
+        ./autogen.sh; \
+    else \
+        autoreconf -fi; \
+    fi; \
+    CFLAGS="--coverage -O0 -g" LDFLAGS="--coverage" \
+      ./configure --prefix=/opt/ocfs2-tools-cov; \
+    make -j"$(nproc)"; \
+    make install; \
+    echo "/opt/ocfs2-tools-src" > /tmp/ocfs2_tools_src_dir
+
+ENV PATH="/opt/ocfs2-tools-cov/sbin:/opt/ocfs2-tools-cov/bin:${PATH}"
+
+WORKDIR /root
+CMD ["/bin/bash"]
