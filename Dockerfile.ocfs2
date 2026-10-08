@@ -26,23 +26,28 @@ RUN set -eux; \
     libglib2.0-dev \
     xfsprogs \
     acl attr \
+    xfslibs-dev uuid-dev libaio-dev libattr1-dev libacl1-dev \
+    libgdbm-dev liburing-dev gawk sqlite3 libssl-dev \
+    libtool-bin e2fsprogs \
 ; \
     rm -rf /var/lib/apt/lists/*
 
-# Установка xfstests (если доступен в репозиториях или компиляция из исходников)
+# xfstests (https://github.com/kdave/xfstests) — нужен fsstress из src/ltp
 RUN set -eux; \
-    if apt-cache search xfstests | grep -q xfstests; then \
-        apt-get update && apt-get install -y xfstests || true; \
-    fi; \
-    if [ ! -d /opt/xfstests ] && [ ! -f /usr/bin/xfstests ] && [ ! -f /usr/share/xfstests/check ]; then \
-        cd /opt; \
-        (git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git xfstests 2>/dev/null) || \
-        (git clone --depth 1 https://github.com/tytso/xfstests.git xfstests 2>/dev/null) || \
-        echo "xfstests не установлен, будет использован только кастомный набор тестов"; \
-        if [ -d xfstests ]; then \
-            cd xfstests; \
-            make 2>/dev/null || echo "Не удалось скомпилировать xfstests"; \
+    cd /opt; \
+    rm -rf xfstests; \
+    (git clone --depth 1 https://github.com/kdave/xfstests.git xfstests) || \
+    (git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git xfstests) || \
+    (git clone --depth 1 https://github.com/tytso/xfstests.git xfstests) || \
+    echo "xfstests не склонирован"; \
+    if [ -d /opt/xfstests ]; then \
+        cd /opt/xfstests; \
+        make -j"$(nproc)" || make || echo "Сборка xfstests завершилась с ошибками"; \
+        if [ -x src/fsstress ] && [ ! -x ltp/fsstress ]; then \
+            mkdir -p ltp; \
+            ln -sf ../src/fsstress ltp/fsstress; \
         fi; \
+        chmod +x check 2>/dev/null || true; \
     fi
 
 RUN mkdir -p /etc/ocfs2 /etc/drbd.d /mnt/ocfs2 /tmp/gcov_reports /opt
@@ -53,6 +58,7 @@ COPY run_tests.sh /run_tests.sh
 COPY collect_kernel_gcov.sh /collect_kernel_gcov.sh
 COPY collect_tools_gcov.sh /collect_tools_gcov.sh
 COPY merge_tools_gcov.sh /merge_tools_gcov.sh
+COPY xfstests_configs /opt/xfstests_configs
 
 RUN chmod +x /setup_drbd.sh /setup_ocfs2_cluster.sh /run_tests.sh /collect_kernel_gcov.sh /collect_tools_gcov.sh /merge_tools_gcov.sh
 

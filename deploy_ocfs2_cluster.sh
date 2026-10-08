@@ -5,8 +5,10 @@
 # Сценарий ориентирован на single-host (все контейнеры на одной машине).
 #
 # Использование:
-#   sudo ./deploy_ocfs2_cluster.sh 4   # 4 узла (при конфликте heartbeat — см. ниже)
-#   sudo ./deploy_ocfs2_cluster.sh 1   # 1 узел: надёжный режим для Docker + один DRBD (монтирование без конфликтов)
+#   sudo ./deploy_ocfs2_cluster.sh 4          # профиль default (generic xfstests)
+#   sudo ./deploy_ocfs2_cluster.sh 1          # 1 узел
+#   sudo ./deploy_ocfs2_cluster_2.sh 1        # профиль features (xattr/acl/refcount)
+#   sudo ./deploy_ocfs2_cluster_3.sh 2        # профиль cluster (DLM/locks, лучше N>=2)
 #   sudo ./deploy_ocfs2_cluster.sh cleanup
 #
 set -euo pipefail
@@ -16,11 +18,19 @@ case "${1:-}" in
   *) ACTION="deploy" ;;
 esac
 
-# --- Конфигурация ---
+# Число узлов — любая цифра 1..8 в argv.
+CLI_NODES=""
+for _arg in "$@"; do
+  case "$_arg" in
+    [1-8]) CLI_NODES="$_arg" ;;
+  esac
+done
+unset _arg
+
 if [[ "$ACTION" == "cleanup" ]]; then
   NODES=8
 else
-  NODES=${1:-4}
+  NODES="${CLI_NODES:-4}"
 fi
 
 CLUSTER_NAME="ocfs2cluster"               # только [A-Za-z0-9]
@@ -29,6 +39,22 @@ DRBD_DEVICE="/dev/drbd0"
 MOUNT_POINT="/mnt/ocfs2"
 NETWORK_NAME="ocfs2-network"
 IMAGE_NAME="ocfs2-node:latest"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+XFSTESTS_PROFILE="${XFSTESTS_PROFILE:-default}"
+OCFS2_XFSTESTS_CONF="${OCFS2_XFSTESTS_CONF:-$SCRIPT_DIR/xfstests_configs/${XFSTESTS_PROFILE}.env}"
+if [[ -f "$OCFS2_XFSTESTS_CONF" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$OCFS2_XFSTESTS_CONF"
+  set +a
+fi
+if [[ "$ACTION" == "cleanup" ]]; then
+  NODES=8
+else
+  NODES="${CLI_NODES:-4}"
+fi
+export OCFS2_NODES="$NODES"
 
 # Минимально рекомендуется >= 2G, иначе mkfs.ocfs2 откажется.
 BACKING_SIZE="${BACKING_SIZE:-4G}"
@@ -60,8 +86,15 @@ ensure_debugfs() {
 }
 
 ensure_docker() {
-  require_cmd docker
-  docker info >/dev/null 2>&1 || { log_error "Docker daemon не запущен"; exit 1; }
+  if ! command -v docker >/dev/null 2>&1; then
+    log_warn "Docker не найден."
+    return 1
+  fi
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  log_warn "Docker daemon недоступен."
+  return 1
 }
 
 ensure_host_drbd9() {
@@ -70,24 +103,30 @@ ensure_host_drbd9() {
   sudo modprobe drbd_transport_tcp >/dev/null 2>&1 || true
 
   if [[ ! -r /proc/drbd ]]; then
-    log_warn "/proc/drbd отсутствует. Пытаемся установить drbd-utils + drbd-dkms (нужен интернет)."
-    sudo apt-get update
-    sudo apt-get install -y drbd-utils drbd-dkms || true
+    if ! command -v drbdadm >/dev/null 2>&1; then
+      log_warn "/proc/drbd отсутствует. Пытаемся установить drbd-utils + drbd-dkms (нужен интернет)."
+      sudo apt-get update
+      sudo apt-get install -y drbd-utils drbd-dkms || true
+    else
+      log_warn "/proc/drbd отсутствует, drbd-utils уже установлены — пробуем только modprobe."
+    fi
     sudo modprobe drbd >/dev/null 2>&1 || true
+    sudo modprobe drbd_transport_tcp >/dev/null 2>&1 || true
   fi
 
   if [[ ! -r /proc/drbd ]]; then
-    log_error "DRBD на host недоступен (/proc/drbd отсутствует)."
-    exit 1
+    log_warn "DRBD на host недоступен (/proc/drbd отсутствует или модуль не загружается)."
+    return 1
   fi
 
   if ! grep -Eq 'version:\s*9\.' /proc/drbd; then
     log_error "Нужен DRBD 9.x. Текущее состояние /proc/drbd:"
     cat /proc/drbd || true
-    exit 1
+    return 1
   fi
 
   log_info "DRBD9 на host обнаружен."
+  return 0
 }
 
 cleanup_host_drbd() {
@@ -115,10 +154,10 @@ cleanup_host_drbd() {
 
   # Отцепить loop устройства, которые указывают на /var/lib/drbd/*
   if [[ -d /var/lib/drbd ]]; then
-    sudo losetup -a | awk '/\/var\/lib\/drbd\//{print $1}' | tr -d ':' | while read -r loopdev; do
+    sudo losetup -a 2>/dev/null | awk '/\/var\/lib\/drbd\//{print $1}' | tr -d ':' | while read -r loopdev; do
       [[ -n "${loopdev:-}" ]] || continue
       sudo losetup -d "$loopdev" >/dev/null 2>&1 || true
-    done
+    done || true
     sudo rm -f /var/lib/drbd/*.img >/dev/null 2>&1 || true
   fi
 
@@ -198,7 +237,7 @@ ensure_clean_drbd_minors() {
       else
         log_error "Существующий ресурс не соответствует требованиям."
         log_error "Попробуйте вручную: sudo drbdsetup down ${DRBD_RESOURCE} && sudo drbdsetup del-resource ${DRBD_RESOURCE}"
-        ls -1 /sys/devices/virtual/block/drbd* 2>/dev/null || true
+        ls -d /sys/devices/virtual/block/drbd* 2>/dev/null || true
         exit 1
       fi
     fi
@@ -386,18 +425,6 @@ configure_ocfs2_cluster() {
   done
   sleep 2
   
-  # Проверяем: если модули или o2hb kernel threads остались — без перезагрузки не обойтись
-  if lsmod 2>/dev/null | grep -q ocfs2; then
-    log_warn "OCFS2 модули не выгрузились (держатся старыми o2hb kernel threads)."
-    if ps aux 2>/dev/null | grep -q '\[o2hb-'; then
-      log_error "На host всё ещё есть [o2hb-XXX] kernel threads — они не убиваются без выгрузки модуля."
-      log_error "Единственный надёжный способ: перезагрузите host один раз, затем выполните:"
-      log_error "  sudo ./deploy_ocfs2_cluster.sh cleanup"
-      log_error "  sudo ./deploy_ocfs2_cluster.sh 1"
-      exit 1
-    fi
-  fi
-  
   # 5) Очищаем dmesg для текущего запуска
   sudo dmesg -c >/dev/null 2>&1 || true
 
@@ -441,58 +468,42 @@ configure_ocfs2_cluster() {
   create_containers
   sleep 3
   
-  # Узел 1: bootstrap (создаёт config и единственный heartbeat-регион)
+  # Узел 1: cluster.conf и регистрация o2cb
   log_info "Настройка узла ocfs2-node-1 (bootstrap)..."
   local bootstrap_log="${PWD:-.}/ocfs2_bootstrap_last.log"
   docker exec "ocfs2-node-1" /setup_ocfs2_cluster.sh "$CLUSTER_NAME" "$NODES" bootstrap > "$bootstrap_log" 2>&1 || true
-  sleep 5
+  sleep 3
 
-  # Проверяем, что в cluster.conf есть секция heartbeat (иначе add-heartbeat не сработал)
-  local conf_check="/tmp/ocfs2_cluster_check_$$.conf"
+  if ! docker exec ocfs2-node-1 test -f /etc/ocfs2/cluster.conf; then
+    log_error "bootstrap не создал /etc/ocfs2/cluster.conf на ocfs2-node-1"
+    [[ -f "$bootstrap_log" ]] && tail -40 "$bootstrap_log" | while read -r line; do echo "  $line"; done
+    exit 1
+  fi
+  log_info "cluster.conf на ocfs2-node-1 готов"
+}
+
+start_heartbeat_after_mkfs() {
+  log_info "Heartbeat на ${DRBD_DEVICE}..."
+  docker exec ocfs2-node-1 /setup_ocfs2_cluster.sh "$CLUSTER_NAME" "$NODES" heartbeat >/dev/null 2>&1 || true
+  sleep 2
+
+  local conf_check="/tmp/ocfs2_cluster_hb_$$.conf"
   docker cp "ocfs2-node-1:/etc/ocfs2/cluster.conf" "$conf_check" 2>/dev/null || true
   if [[ ! -f "$conf_check" ]] || ! grep -q "heartbeat:" "$conf_check"; then
-    log_error "В cluster.conf узла 1 нет секции heartbeat (add-heartbeat не выполнился или устройство /dev/drbd0 не готово)."
-    log_error "Вывод bootstrap (последние строки):"
-    [[ -f "$bootstrap_log" ]] && tail -60 "$bootstrap_log" | while read -r line; do echo "  $line"; done
-    log_error "Полный лог сохранён в: $bootstrap_log"
-      rm -f "$conf_check"
-      exit 1
-    fi
-  
-  if [[ "$NODES" -ge 2 ]]; then
-    # Копируем cluster.conf (уже в conf_check) на узлы 2..N
+    docker exec ocfs2-node-1 /setup_ocfs2_cluster.sh "$CLUSTER_NAME" "$NODES" heartbeat >/dev/null 2>&1 || true
+    sleep 2
+    docker cp "ocfs2-node-1:/etc/ocfs2/cluster.conf" "$conf_check" 2>/dev/null || true
+  fi
+
+  if [[ "$NODES" -ge 2 && -f "$conf_check" ]]; then
     log_info "Копирование cluster.conf на узлы 2..$NODES..."
     for i in $(seq 2 "$NODES"); do
-      docker cp "$conf_check" "ocfs2-node-$i:/etc/ocfs2/cluster.conf" || {
-        log_error "Не удалось скопировать cluster.conf на ocfs2-node-$i"
-        rm -f "$conf_check"
-        exit 1
-      }
-    done
-    rm -f "$conf_check"
-    # Узлы 2..N: join (только register + start-heartbeat, без add-heartbeat)
-    for i in $(seq 2 "$NODES"); do
-      log_info "Настройка узла ocfs2-node-$i (join)..."
-      docker exec "ocfs2-node-$i" /setup_ocfs2_cluster.sh "$CLUSTER_NAME" "$NODES" join >/dev/null 2>&1
-      sleep 3
+      docker cp "$conf_check" "ocfs2-node-$i:/etc/ocfs2/cluster.conf" >/dev/null 2>&1 || true
+      docker exec "ocfs2-node-$i" /setup_ocfs2_cluster.sh "$CLUSTER_NAME" "$NODES" register >/dev/null 2>&1 || true
     done
   fi
   rm -f "$conf_check"
-
-  log_info "Ожидание синхронизации кластера (один heartbeat-регион для всех узлов)..."
-  sleep 10
-  
-  for i in $(seq 1 "$NODES"); do
-    local name="ocfs2-node-$i"
-    if docker exec "$name" o2cb cluster-status "$CLUSTER_NAME" >/dev/null 2>&1; then
-      log_info "✓ Кластер онлайн на $name"
-    else
-      log_warn "Кластер не онлайн на $name, повторная попытка..."
-      docker exec "$name" o2cb start-heartbeat "$CLUSTER_NAME" >/dev/null 2>&1 || true
-      sleep 2
-    fi
-  done
-  sleep 3
+  sleep 4
 }
 
 create_filesystem() {
@@ -506,9 +517,14 @@ create_filesystem() {
   fi
   
   # Используем yes для автоматического подтверждения, если mkfs всё ещё запрашивает
-  echo "y" | docker exec -i ocfs2-node-1 mkfs.ocfs2 -F -N "$NODES" -T datafiles \
-    --cluster-stack=o2cb --cluster-name="$CLUSTER_NAME" -L "ocfs2vol" "$DRBD_DEVICE" || \
-  docker exec ocfs2-node-1 bash -c "echo y | mkfs.ocfs2 -F -N $NODES -T datafiles --cluster-stack=o2cb --cluster-name=$CLUSTER_NAME -L ocfs2vol $DRBD_DEVICE"
+  local mkfs_extra=()
+  if [[ -n "${MKFS_FEATURES:-}" ]]; then
+    mkfs_extra+=(--fs-features="${MKFS_FEATURES}")
+    log_info "mkfs.ocfs2 extra features: ${MKFS_FEATURES}"
+  fi
+  echo "y" | docker exec -i ocfs2-node-1 mkfs.ocfs2 -F -N "$NODES" -T "${MKFS_TYPE:-datafiles}" \
+    --cluster-stack=o2cb --cluster-name="$CLUSTER_NAME" -L "ocfs2vol" "${mkfs_extra[@]}" "$DRBD_DEVICE" || \
+  docker exec ocfs2-node-1 bash -c "echo y | mkfs.ocfs2 -F -N $NODES -T ${MKFS_TYPE:-datafiles} --cluster-stack=o2cb --cluster-name=$CLUSTER_NAME -L ocfs2vol ${MKFS_FEATURES:+--fs-features=$MKFS_FEATURES} $DRBD_DEVICE"
   
   log_info "Файловая система создана"
   log_info "Ожидание синхронизации файловой системы..."
@@ -517,82 +533,137 @@ create_filesystem() {
 
 mount_fs_all_nodes() {
   log_info "Монтирование FS на всех узлах..."
-  
-  # Даём время кластеру полностью запуститься
-  log_info "Ожидание готовности кластера OCFS2..."
-  sleep 5
-  
-  # Проверяем статус кластера на каждом узле перед монтированием
-  for i in $(seq 1 "$NODES"); do
-    local name="ocfs2-node-$i"
-    log_info "Проверка статуса кластера на $name..."
-    if docker exec "$name" o2cb cluster-status "$CLUSTER_NAME" >/dev/null 2>&1; then
-      log_info "Кластер онлайн на $name"
-    else
-      log_warn "Кластер не онлайн на $name, пытаемся запустить..."
-      docker exec "$name" o2cb start-heartbeat "$CLUSTER_NAME" >/dev/null 2>&1 || true
-      sleep 2
-    fi
-    if docker exec "$name" test -b "${DRBD_DEVICE}" >/dev/null 2>&1; then
-      log_info "Устройство доступно на $name"
-    else
-      log_error "Устройство ${DRBD_DEVICE} недоступно на $name"
-      exit 1
-    fi
-  done
-  
   sleep 3
-  
+
+  local mounted=0
   for i in $(seq 1 "$NODES"); do
     local name="ocfs2-node-$i"
-    docker exec "$name" mkdir -p "$MOUNT_POINT"
-    
-    # Пытаемся смонтировать с несколькими повторами
-    local mount_attempt=0
-    local max_attempts=5
-    while [ $mount_attempt -lt $max_attempts ]; do
-      mount_err=$(docker exec "$name" mount -t ocfs2 "$DRBD_DEVICE" "$MOUNT_POINT" 2>&1) && {
-        log_info "✓ FS смонтирована на $name"
+    docker exec "$name" mkdir -p "$MOUNT_POINT" >/dev/null 2>&1 || true
+
+    local ok=0
+    local attempt=0
+    while [ $attempt -lt 5 ]; do
+      attempt=$((attempt + 1))
+      if docker exec "$name" mountpoint -q "$MOUNT_POINT" >/dev/null 2>&1; then
+        ok=1
         break
-      }
-      mount_attempt=$((mount_attempt + 1))
-      if [ $mount_attempt -lt $max_attempts ]; then
-        log_warn "mount на $name не удался (попытка $mount_attempt/$max_attempts): ${mount_err:-unknown}"
-        sleep 3
-      else
-        log_error "Не удалось смонтировать FS на $name после $max_attempts попыток"
-        log_error "Ошибка mount: ${mount_err:-unknown}"
-        log_error "dmesg на $name (последние строки):"
-        docker exec "$name" dmesg 2>/dev/null | tail -25 | while read -r line; do echo -e "  $line"; done
-        log_error "Проверьте: docker exec $name o2cb cluster-status $CLUSTER_NAME"
-        log_error "Проверьте: docker exec $name o2cb list-heartbeats $CLUSTER_NAME"
-        log_error "Если в dmesg несколько регионов (o2hb-XXX, o2hb-YYY): старые o2hb kernel threads не выгружаются — перезагрузите host, затем: sudo ./deploy_ocfs2_cluster.sh cleanup ; sudo ./deploy_ocfs2_cluster.sh $NODES"
-        exit 1
       fi
+      if docker exec "$name" mount -i -t ocfs2 "$DRBD_DEVICE" "$MOUNT_POINT" >/dev/null 2>&1; then
+        ok=1
+        break
+      fi
+      if docker exec "$name" mount -t ocfs2 "$DRBD_DEVICE" "$MOUNT_POINT" >/dev/null 2>&1; then
+        ok=1
+        break
+      fi
+      sleep 2
     done
+
+    if [ "$ok" -eq 1 ]; then
+      log_info "✓ FS смонтирована на $name"
+      mounted=$((mounted + 1))
+    fi
   done
-  log_info "FS смонтирована на всех узлах"
+
+  if [ "$mounted" -eq 0 ]; then
+    return 1
+  fi
+  log_info "FS смонтирована на $mounted узлах"
 }
 
 run_tests() {
   log_info "Запуск тестов..."
   rm -f /tmp/test_results_node_*.log >/dev/null 2>&1 || true
 
+  local ran=0
   for i in $(seq 1 "$NODES"); do
-    ( docker exec "ocfs2-node-$i" /run_tests.sh "$MOUNT_POINT" "$NODES" > "/tmp/test_results_node_${i}.log" 2>&1 ) &
+    local name="ocfs2-node-$i"
+    if ! docker exec "$name" mountpoint -q "$MOUNT_POINT" >/dev/null 2>&1; then
+      continue
+    fi
+    ran=$((ran + 1))
+    ( docker exec \
+        -e XFSTESTS_PROFILE="${XFSTESTS_PROFILE:-default}" \
+        -e OCFS2_XFSTESTS_CONF="/opt/xfstests_configs/${XFSTESTS_PROFILE:-default}.env" \
+        -e CLUSTER_NAME="$CLUSTER_NAME" \
+        "$name" /run_tests.sh "$MOUNT_POINT" "$NODES" > "/tmp/test_results_node_${i}.log" 2>&1 ) &
   done
   wait || true
 
+  if [ "$ran" -eq 0 ]; then
+    return 0
+  fi
+
   log_info "Результаты тестов (также сохраняются в отчёт):"
   for i in $(seq 1 "$NODES"); do
+    [[ -f "/tmp/test_results_node_${i}.log" ]] || continue
     echo "---- ocfs2-node-$i ----"
     cat "/tmp/test_results_node_${i}.log" || true
     echo
   done
 }
 
+finalize_report_dir() {
+  local d="$1"
+  [[ -d "$d" ]] || return 0
+  rm -rf "$d"/node_*_gcov
+  if [[ -d "$d/tools_tracefiles" ]] && [[ -z "$(ls -A "$d/tools_tracefiles" 2>/dev/null || true)" ]]; then
+    rmdir "$d/tools_tracefiles" 2>/dev/null || true
+  fi
+  if [[ -d "$d/tools_html" ]] && [[ ! -f "$d/tools_html/index.html" ]] && [[ -z "$(ls -A "$d/tools_html" 2>/dev/null || true)" ]]; then
+    rmdir "$d/tools_html" 2>/dev/null || true
+  fi
+  chmod -R a+rX "$d" 2>/dev/null || true
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    chown -R "${SUDO_USER}:" "$d" 2>/dev/null || true
+  fi
+}
+
+generate_kernel_html_report() {
+  local report_dir="$1"
+  mkdir -p "$report_dir/kernel_html" "$report_dir/test_results" "$report_dir/tools_html"
+  local gen="$SCRIPT_DIR/coverage/generate_ocfs2_html_report.py"
+  if [[ ! -f "$gen" ]]; then
+    log_warn "Нет $gen — интерактивный kernel HTML не будет собран"
+    return 0
+  fi
+  local lcov_args=()
+  if [[ -f "$report_dir/kernel_ocfs2.info" ]] && grep -q '^DA:' "$report_dir/kernel_ocfs2.info" 2>/dev/null; then
+    lcov_args+=(--lcov "$report_dir/kernel_ocfs2.info")
+    log_info "lcov: $report_dir/kernel_ocfs2.info"
+  fi
+  log_info "Генерация интерактивного HTML покрытия OCFS2 (профиль ${XFSTESTS_PROFILE:-default}, узлов: ${OCFS2_NODES:-$NODES})..."
+  local py_cmd=(python3 "$gen"
+    --src "$SCRIPT_DIR/coverage/ocfs2_src"
+    --out "$report_dir/kernel_html"
+    --profile "${XFSTESTS_PROFILE:-default}"
+    --report-root "$report_dir"
+    --nodes "${OCFS2_NODES:-$NODES}")
+  if [[ ${#lcov_args[@]} -gt 0 ]]; then
+    py_cmd+=("${lcov_args[@]}")
+  fi
+  "${py_cmd[@]}" || {
+      log_warn "Генератор HTML вернул ошибку"
+      return 1
+    }
+  chmod -R a+rX "$report_dir" 2>/dev/null || true
+  if [[ -f "$report_dir/kernel_html/index.html" ]]; then
+    local nfiles
+    nfiles="$(find "$report_dir/kernel_html/files" -name '*.html' 2>/dev/null | wc -l | tr -d ' ')"
+    log_info "✓ Kernel HTML: $report_dir/kernel_html/index.html (файлов драйвера: $nfiles)"
+    log_info "✓ Сводка отчёта: $report_dir/index.html"
+    local i
+    for i in $(seq 1 "${OCFS2_NODES:-$NODES}"); do
+      if [[ -f "$report_dir/node_${i}_tests/kernel_html/index.html" ]]; then
+        log_info "✓ Покрытие ocfs2-node-$i: $report_dir/node_${i}_tests/kernel_html/index.html"
+      fi
+    done
+  fi
+  finalize_report_dir "$report_dir"
+}
+
 collect_reports() {
-  local report_dir="gcov_reports_$(date +%Y%m%d_%H%M%S)"
+  local report_dir="gcov_reports_${XFSTESTS_PROFILE:-default}_$(date +%Y%m%d_%H%M%S)_$$"
   mkdir -p "$report_dir"
 
   # ---- Сохраняем результаты тестов для визуализации ----
@@ -651,351 +722,45 @@ collect_reports() {
     log_info "Извлечение данных для OCFS2..."
     sudo lcov --extract "$report_dir/kernel_raw.info" "*/fs/ocfs2/*" --output-file "$report_dir/kernel_ocfs2.info" \
       --ignore-errors unused,empty 2>/dev/null || true
-    
-    # Проверяем, есть ли данные в файле
-    if [[ -f "$report_dir/kernel_ocfs2.info" ]] && [[ -s "$report_dir/kernel_ocfs2.info" ]]; then
-      log_info "Генерация HTML отчёта..."
-      # Используем --source-directory для указания пути к исходникам (если есть)
-      # Или генерируем без исходников, если их нет
-      # Добавляем --prefix для правильной обработки путей и --no-branch-coverage для совместимости
-      sudo genhtml "$report_dir/kernel_ocfs2.info" --output-directory "$report_dir/kernel_html" \
-        --ignore-errors source,unused,empty,unreachable,negative \
-        --no-branch-coverage \
-        --prefix "$(pwd)" \
-        2>&1 | grep -v "stamp mismatch\|cannot open\|WARNING.*source" || true
-      
-      # Проверяем, что HTML файл создан и не пустой
-      if [[ -f "$report_dir/kernel_html/index.html" ]] && [[ -s "$report_dir/kernel_html/index.html" ]]; then
-        local html_size=$(stat -c%s "$report_dir/kernel_html/index.html" 2>/dev/null || echo "0")
-        if [ "$html_size" -gt 1000 ]; then
-          log_info "✓ Kernel HTML: $report_dir/kernel_html/index.html (размер: $html_size байт)"
-        else
-          log_warn "Kernel HTML создан, но слишком мал ($html_size байт), возможно пуст"
-          # Пробуем создать без исходников
-          log_info "Повторная генерация без исходников..."
-          sudo genhtml "$report_dir/kernel_ocfs2.info" --output-directory "$report_dir/kernel_html" \
-            --ignore-errors source,unused,empty,unreachable,negative \
-            --no-branch-coverage \
-            --no-source \
-            2>&1 | grep -v "stamp mismatch\|cannot open\|WARNING.*source" || true
-        fi
-      else
-        log_warn "HTML не создан или пуст. Возможно, нет исходников ядра на хосте."
-        log_warn "GCOV данные содержат пути из VM: /home/ubuntu-24-for-kernel-build/kernel-sources/noble/"
-        log_warn "Для генерации HTML скопируйте исходники ядра на хост в тот же путь или используйте --source-directory"
-        # Создаем минимальный HTML для отображения данных покрытия без исходников
-        mkdir -p "$report_dir/kernel_html"
-        log_info "Генерация HTML без исходников..."
-        sudo genhtml "$report_dir/kernel_ocfs2.info" --output-directory "$report_dir/kernel_html" \
-          --ignore-errors source,unused,empty,unreachable,negative \
-          --no-branch-coverage \
-          --no-source \
-          2>&1 | grep -v "stamp mismatch\|cannot open\|WARNING.*source" || true
-        
-        # Проверяем результат
-        if [[ -f "$report_dir/kernel_html/index.html" ]] && [[ -s "$report_dir/kernel_html/index.html" ]]; then
-          local html_size=$(stat -c%s "$report_dir/kernel_html/index.html" 2>/dev/null || echo "0")
-          log_info "✓ Kernel HTML создан без исходников (размер: $html_size байт)"
-        else
-          log_warn "Не удалось создать Kernel HTML даже без исходников"
-        fi
-      fi
-    else
-      log_warn "kernel_ocfs2.info пуст или отсутствует. Возможно, нет данных покрытия для OCFS2."
-      # Плейсхолдер, чтобы kernel_html не был пустым
-      mkdir -p "$report_dir/kernel_html"
-      {
-        echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Kernel OCFS2 Coverage</title></head><body>'
-        echo '<h1>Kernel OCFS2 coverage</h1><p>No coverage data.</p>'
-        echo '<p>Possible reasons: /sys/kernel/debug/gcov missing or empty; kernel built without CONFIG_GCOV_KERNEL;'
-        echo ' debugfs not mounted; or lcov capture failed (e.g. DRBD/DKMS).</p>'
-        echo '<p>Ensure kernel was built with GCOV and run: <code>sudo mount -t debugfs debugfs /sys/kernel/debug</code></p>'
-        echo '</body></html>'
-      } > "$report_dir/kernel_html/index.html"
-    fi
-  else
-    log_warn "/sys/kernel/debug/gcov отсутствует. Нужны CONFIG_GCOV_KERNEL=y и debugfs."
-    mkdir -p "$report_dir/kernel_html"
-    {
-      echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Kernel OCFS2 Coverage</title></head><body>'
-      echo '<h1>Kernel OCFS2 coverage</h1><p>/sys/kernel/debug/gcov not found.</p>'
-      echo '<p>Kernel needs CONFIG_GCOV_KERNEL=y and debugfs mounted: <code>sudo mount -t debugfs debugfs /sys/kernel/debug</code></p>'
-      echo '</body></html>'
-    } > "$report_dir/kernel_html/index.html"
   fi
 
   # ---- Сохранение результатов тестов из узлов ----
-  log_info "Копирование результатов тестов из узлов..."
   for i in $(seq 1 "$NODES"); do
     local name="ocfs2-node-$i"
     local node_test_dir="$report_dir/node_${i}_tests"
     mkdir -p "$node_test_dir"
-    
-    # Проверяем, что контейнер еще работает
-    if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-      log_warn "Контейнер $name не запущен, пропускаем копирование тестов"
-      continue
-    fi
-    
-    # Пробуем скопировать результаты тестов (может быть несколько вариантов путей)
-    local copied=0
-    if docker cp "${name}:/tmp/test_results_${name}" "$node_test_dir" 2>/dev/null; then
-      copied=1
-      log_info "✓ Результаты тестов скопированы с $name"
-    elif docker cp "${name}:/tmp/test_results_ocfs2-node-${i}" "$node_test_dir" 2>/dev/null; then
-      copied=1
-      log_info "✓ Результаты тестов скопированы с $name (альтернативный путь)"
-    else
-      # Пробуем скопировать отдельные файлы
-      log_warn "Не удалось скопировать папку с $name, пробуем отдельные файлы..."
-      mkdir -p "$node_test_dir/test_results_${name}"
-      docker cp "${name}:/tmp/test_results_${name}/node_info.txt" "$node_test_dir/test_results_${name}/" 2>/dev/null || true
-      docker cp "${name}:/tmp/test_results_${name}/summary.txt" "$node_test_dir/test_results_${name}/" 2>/dev/null || true
-      docker cp "${name}:/tmp/test_results_${name}/xfstests_summary.txt" "$node_test_dir/test_results_${name}/" 2>/dev/null || true
-      docker cp "${name}:/tmp/test_results_${name}/xfstests.log" "$node_test_dir/test_results_${name}/" 2>/dev/null || true
-      if [ -f "$node_test_dir/test_results_${name}/node_info.txt" ]; then
-        copied=1
-        log_info "✓ Результаты тестов скопированы с $name (отдельные файлы)"
-      fi
-    fi
-    
-    if [ "$copied" -eq 0 ]; then
-      log_warn "Не удалось скопировать результаты тестов с $name"
-      # Проверяем, что есть в контейнере
-      log_info "Содержимое /tmp в контейнере $name:"
-      docker exec "$name" ls -la /tmp/ | grep -i test || log_warn "  (нет файлов с 'test' в имени)"
-    fi
+    docker ps --format '{{.Names}}' | grep -qx "$name" || continue
+    docker cp "${name}:/tmp/test_results_${name}" "$node_test_dir" >/dev/null 2>&1 || \
+      docker cp "${name}:/tmp/test_results_ocfs2-node-${i}" "$node_test_dir" >/dev/null 2>&1 || true
   done
 
-  # ---- ocfs2-tools coverage (containers) ----
-  log_info "Сбор tools coverage на каждом узле..."
-  mkdir -p "$report_dir/tools_tracefiles"
-  
-  # Проверяем, что хотя бы один контейнер работает
-  if ! docker ps --format '{{.Names}}' | grep -q "ocfs2-node-1"; then
-    log_warn "Контейнер ocfs2-node-1 не запущен, пропускаем сбор tools coverage"
-  else
+  if docker ps --format '{{.Names}}' | grep -qx "ocfs2-node-1"; then
+    mkdir -p "$report_dir/tools_tracefiles"
     docker exec ocfs2-node-1 bash -lc 'mkdir -p /tmp/gcov_reports/merge_inputs' >/dev/null 2>&1 || true
-
+    local tracefiles_count=0
     for i in $(seq 1 "$NODES"); do
       local name="ocfs2-node-$i"
-      
-      # Проверяем, что контейнер работает
-      if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-        log_warn "Контейнер $name не запущен, пропускаем сбор coverage"
-        continue
+      docker ps --format '{{.Names}}' | grep -qx "$name" || continue
+      docker exec "$name" /collect_tools_gcov.sh "$i" >/dev/null 2>&1 || true
+      if docker exec "$name" test -s "/tmp/gcov_reports/ocfs2_tools_node${i}.info" 2>/dev/null; then
+        docker cp "${name}:/tmp/gcov_reports/ocfs2_tools_node${i}.info" \
+          "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" >/dev/null 2>&1 || true
       fi
-      
-      log_info "Сбор coverage на $name..."
-      local collect_log="$report_dir/collect_node${i}.log"
-      docker exec "$name" /collect_tools_gcov.sh "$i" > "$collect_log" 2>&1 || log_warn "Ошибка при сборе coverage на $name"
-      
-      # Проверяем, что файл создался в контейнере
-      if docker exec "$name" test -f "/tmp/gcov_reports/ocfs2_tools_node${i}.info" 2>/dev/null; then
-        local file_size=$(docker exec "$name" stat -c%s "/tmp/gcov_reports/ocfs2_tools_node${i}.info" 2>/dev/null || echo "0")
-        if [ "$file_size" -gt 0 ]; then
-          log_info "  Tracefile существует в контейнере (размер: $file_size байт)"
-          
-          # копируем tracefile в host
-          if docker cp "${name}:/tmp/gcov_reports/ocfs2_tools_node${i}.info" "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" 2>/dev/null; then
-            log_info "✓ Tracefile скопирован с $name"
-          else
-            log_warn "Не удалось скопировать tracefile с $name (файл существует в контейнере)"
-            # Пробуем скопировать через exec cat
-            docker exec "$name" cat "/tmp/gcov_reports/ocfs2_tools_node${i}.info" > "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" 2>/dev/null && \
-              log_info "✓ Tracefile скопирован через cat" || \
-              log_warn "Не удалось скопировать даже через cat"
-          fi
-        else
-          log_warn "Tracefile существует, но пуст (размер: $file_size)"
-          # Показываем последние строки лога сбора
-          log_info "Последние строки лога сбора:"
-          tail -5 "$collect_log" | while read -r line; do echo "  $line"; done
-        fi
-      else
-        log_warn "Tracefile не создан в контейнере $name"
-        log_info "Проверяем содержимое /tmp/gcov_reports в контейнере:"
-        docker exec "$name" ls -la /tmp/gcov_reports/ 2>/dev/null | head -10 || log_warn "  Директория не существует"
-        log_info "Последние строки лога сбора:"
-        tail -10 "$collect_log" | while read -r line; do echo "  $line"; done
-      fi
-
-      # копируем все артефакты узла
-      if docker cp "${name}:/tmp/gcov_reports" "$report_dir/node_${i}_gcov" 2>/dev/null; then
-        log_info "✓ GCOV артефакты скопированы с $name"
-      else
-        log_warn "Не удалось скопировать GCOV артефакты с $name"
+      if [[ -s "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" ]]; then
+        docker cp "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" \
+          "ocfs2-node-1:/tmp/gcov_reports/merge_inputs/ocfs2_tools_node${i}.info" >/dev/null 2>&1 || true
+        tracefiles_count=$((tracefiles_count + 1))
       fi
     done
+    if [[ "$tracefiles_count" -gt 0 ]]; then
+      docker exec ocfs2-node-1 /merge_tools_gcov.sh "$NODES" >/dev/null 2>&1 || true
+      docker cp "ocfs2-node-1:/tmp/gcov_reports/tools_html" "$report_dir/tools_html" >/dev/null 2>&1 || true
+    fi
   fi
+  mkdir -p "$report_dir/tools_html"
 
-  # складываем tracefile в node1 и делаем merge + HTML внутри node1 (там есть исходники)
-  if docker ps --format '{{.Names}}' | grep -qx "ocfs2-node-1"; then
-    local tracefiles_count=0
-    log_info "Проверка tracefile для объединения..."
-    for i in $(seq 1 "$NODES"); do
-      if [[ -f "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" ]] && [[ -s "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" ]]; then
-        local file_size=$(stat -c%s "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" 2>/dev/null || echo "0")
-        log_info "  Найден tracefile для node $i (размер: $file_size байт)"
-        if docker cp "$report_dir/tools_tracefiles/ocfs2_tools_node${i}.info" \
-          "ocfs2-node-1:/tmp/gcov_reports/merge_inputs/ocfs2_tools_node${i}.info" >/dev/null 2>&1; then
-          tracefiles_count=$((tracefiles_count + 1))
-          log_info "  ✓ Tracefile node $i скопирован в node1 для объединения"
-        else
-          log_warn "  Не удалось скопировать tracefile node $i в node1"
-        fi
-      else
-        log_warn "  Tracefile для node $i отсутствует или пуст"
-      fi
-    done
-    log_info "Найдено $tracefiles_count tracefile для объединения"
-    
-    if [ "$tracefiles_count" -gt 0 ]; then
-      log_info "Генерация единого tools HTML (внутри ocfs2-node-1, найдено $tracefiles_count tracefile)..."
-      
-      # Проверяем, что файлы действительно скопировались в node1
-      log_info "Проверка tracefile в node1 перед объединением:"
-      docker exec ocfs2-node-1 ls -lh /tmp/gcov_reports/merge_inputs/ 2>/dev/null | head -10 || log_warn "  Директория merge_inputs не существует"
-      
-      docker exec ocfs2-node-1 /merge_tools_gcov.sh "$NODES" > "$report_dir/ocfs2_tools_merge.txt" 2>&1 || log_warn "Ошибка при генерации HTML"
-      
-      # Показываем последние строки лога объединения
-      log_info "Последние строки лога объединения:"
-      tail -10 "$report_dir/ocfs2_tools_merge.txt" | while read -r line; do echo "  $line"; done
-      
-      # Проверяем, что HTML создался
-      if docker exec ocfs2-node-1 test -f "/tmp/gcov_reports/tools_html/index.html" 2>/dev/null; then
-        local html_size=$(docker exec ocfs2-node-1 stat -c%s "/tmp/gcov_reports/tools_html/index.html" 2>/dev/null || echo "0")
-        log_info "HTML создан в контейнере (размер: $html_size байт)"
-        
-        if docker cp "ocfs2-node-1:/tmp/gcov_reports/tools_html" "$report_dir/tools_html" 2>/dev/null; then
-          log_info "✓ Tools HTML скопирован"
-        else
-          log_warn "Не удалось скопировать tools_html, пробуем через tar..."
-          docker exec ocfs2-node-1 tar czf - -C /tmp/gcov_reports tools_html 2>/dev/null | tar xzf - -C "$report_dir" 2>/dev/null && \
-            log_info "✓ Tools HTML скопирован через tar" || \
-            log_warn "Не удалось скопировать даже через tar"
-        fi
-      else
-        log_warn "HTML не создан в контейнере"
-        log_info "Проверяем содержимое /tmp/gcov_reports/tools_html в контейнере:"
-        docker exec ocfs2-node-1 ls -la /tmp/gcov_reports/tools_html/ 2>/dev/null || log_warn "  Директория tools_html не существует"
-      fi
-      
-      docker cp "ocfs2-node-1:/tmp/gcov_reports/ocfs2_tools_merged.info" "$report_dir/ocfs2_tools_merged.info" 2>/dev/null || true
-    else
-      log_warn "Нет tracefile для объединения, пропускаем генерацию tools HTML"
-      log_info "Доступные tracefile в $report_dir/tools_tracefiles/:"
-      ls -lh "$report_dir/tools_tracefiles/" 2>/dev/null || log_warn "  Директория пуста или не существует"
-    fi
-  else
-    log_warn "Контейнер ocfs2-node-1 не запущен, пропускаем генерацию tools HTML"
-  fi
-
-  if [[ -f "$report_dir/tools_html/index.html" ]] && [[ -s "$report_dir/tools_html/index.html" ]]; then
-    log_info "✓ Tools HTML: $report_dir/tools_html/index.html"
-  else
-    log_warn "Tools HTML не создан. См. $report_dir/ocfs2_tools_merge.txt и $report_dir/tools_tracefiles/"
-    mkdir -p "$report_dir/tools_html"
-    {
-      echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>OCFS2 Tools Coverage</title></head><body>'
-      echo '<h1>OCFS2 tools coverage</h1><p>Merged HTML was not generated.</p>'
-      echo '<p><a href="../ocfs2_tools_merge.txt">Merge log (ocfs2_tools_merge.txt)</a></p>'
-      echo '<p>Tracefiles:</p><ul>'
-      for f in "$report_dir/tools_tracefiles"/ocfs2_tools_node*.info; do
-        [[ -f "$f" ]] && echo '<li><a href="../tools_tracefiles/'"$(basename "$f")"'">'"$(basename "$f")"'</a></li>'
-      done
-      echo '</ul></body></html>'
-    } > "$report_dir/tools_html/index.html"
-  fi
-
-  # Финальная проверка сохраненных отчетов
-  log_info ""
-  log_info "=== Сводка сохраненных отчетов ==="
-  log_info "Директория отчетов: $report_dir"
-  log_info ""
-  
-  # Проверяем test_results
-  if [ -f "$report_dir/test_results/index.html" ] && [ -s "$report_dir/test_results/index.html" ]; then
-    local size=$(stat -c%s "$report_dir/test_results/index.html" 2>/dev/null || echo "0")
-    log_info "✓ test_results/index.html - сохранен (размер: $size байт)"
-  else
-    log_warn "✗ test_results/index.html - отсутствует или пуст"
-    # Проверяем, есть ли хотя бы логи
-    local log_count=$(find "$report_dir/test_results" -name "*.log" -type f 2>/dev/null | wc -l)
-    if [ "$log_count" -gt 0 ]; then
-      log_info "  Найдено $log_count лог-файлов в test_results/"
-    fi
-  fi
-  
-  # Проверяем kernel_html
-  if [ -f "$report_dir/kernel_html/index.html" ] && [ -s "$report_dir/kernel_html/index.html" ]; then
-    SIZE=$(du -h "$report_dir/kernel_html/index.html" 2>/dev/null | cut -f1)
-    log_info "✓ kernel_html/index.html - сохранен (размер: $SIZE)"
-  else
-    log_warn "✗ kernel_html/index.html - отсутствует или пуст"
-  fi
-  
-  # Проверяем tools_html
-  if [ -f "$report_dir/tools_html/index.html" ] && [ -s "$report_dir/tools_html/index.html" ]; then
-    local html_size=$(stat -c%s "$report_dir/tools_html/index.html" 2>/dev/null || echo "0")
-    SIZE=$(du -h "$report_dir/tools_html/index.html" 2>/dev/null | cut -f1)
-    if [ "$html_size" -gt 1000 ]; then
-      log_info "✓ tools_html/index.html - сохранен (размер: $SIZE, $html_size байт)"
-    else
-      log_warn "✗ tools_html/index.html - слишком мал ($html_size байт), возможно пуст"
-    fi
-  else
-    log_warn "✗ tools_html/index.html - отсутствует или пуст"
-    # Проверяем tracefile
-    local tracefile_count=$(find "$report_dir/tools_tracefiles" -name "*.info" -type f -size +0 2>/dev/null | wc -l)
-    if [ "$tracefile_count" -gt 0 ]; then
-      log_info "  Найдено $tracefile_count непустых tracefile в tools_tracefiles/"
-      log_info "  Проверьте логи объединения: $report_dir/ocfs2_tools_merge.txt"
-    else
-      log_warn "  Tracefile отсутствуют или пусты - это причина отсутствия HTML"
-    fi
-  fi
-  
-  # Проверяем сохранение тестов из узлов
-  NODES_SAVED=0
-  for i in $(seq 1 "$NODES"); do
-    if [ -d "$report_dir/node_${i}_tests" ] && [ "$(ls -A "$report_dir/node_${i}_tests" 2>/dev/null)" ]; then
-      NODES_SAVED=$((NODES_SAVED + 1))
-    fi
-  done
-  if [ "$NODES_SAVED" -gt 0 ]; then
-    log_info "✓ Тесты из узлов сохранены ($NODES_SAVED из $NODES узлов)"
-  else
-    log_warn "✗ Тесты из узлов не сохранены"
-  fi
-  
-  log_info ""
-  log_info "Все отчёты сохранены в: $report_dir"
-  log_info "Откройте в браузере:"
-  log_info "  - Тесты: $report_dir/test_results/index.html"
-  log_info "  - Kernel coverage: $report_dir/kernel_html/index.html"
-  log_info "  - Tools coverage: $report_dir/tools_html/index.html"
-  
-  # Выводим структуру директории для удобства
-  log_info ""
-  log_info "Структура отчетов:"
-  if command -v tree >/dev/null 2>&1; then
-    tree -L 2 "$report_dir" 2>/dev/null || find "$report_dir" -maxdepth 2 -type d | head -20
-  else
-    find "$report_dir" -maxdepth 2 -type d | head -20
-  fi
-  
-  # Показываем размеры файлов
-  log_info ""
-  log_info "Размеры файлов:"
-  for f in "$report_dir/test_results/index.html" "$report_dir/kernel_html/index.html" "$report_dir/tools_html/index.html"; do
-    if [ -f "$f" ]; then
-      local size=$(stat -c%s "$f" 2>/dev/null || echo "0")
-      local human_size=$(du -h "$f" 2>/dev/null | cut -f1)
-      echo "  $(basename $(dirname $f))/$(basename $f): $human_size ($size байт)"
-    fi
-  done
+  generate_kernel_html_report "$report_dir"
+  log_info "Готово: $report_dir/index.html"
 }
 
 cleanup() {
@@ -1037,7 +802,7 @@ main() {
     exit 0
   fi
 
-  log_info "Начало развёртывания OCFS2. Узлов: $NODES"
+  log_info "Начало развёртывания OCFS2. Узлов: $NODES  профиль xfstests: ${XFSTESTS_PROFILE:-default}"
   if [[ "$NODES" -lt 1 || "$NODES" -gt 8 ]]; then
     log_error "Количество узлов должно быть 1..8"
     exit 1
@@ -1048,22 +813,22 @@ main() {
 
   trap 'log_warn "Прерывание — выполняю cleanup..."; cleanup; exit 1' INT TERM
 
-  ensure_docker
-  ensure_host_drbd9
-  ensure_clean_drbd_minors
-
-  create_network
-  build_image
-  host_setup_drbd_single
-
-  configure_ocfs2_cluster
-  create_filesystem
-  mount_fs_all_nodes
-  run_tests
-  collect_reports
+  if ensure_docker && ensure_host_drbd9 && (
+      ensure_clean_drbd_minors
+      create_network
+      build_image
+      host_setup_drbd_single
+      configure_ocfs2_cluster
+      create_filesystem
+      start_heartbeat_after_mkfs
+      mount_fs_all_nodes
+      run_tests
+    ); then
+    :
+  fi
 
   trap - INT TERM
-  log_info "Готово. Для очистки: sudo ./deploy_ocfs2_cluster.sh cleanup"
+  collect_reports
 }
 
 main
