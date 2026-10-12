@@ -6,7 +6,7 @@ set -euo pipefail
 
 CLUSTER_NAME=$1
 TOTAL_NODES=$2
-MODE="${3:-bootstrap}"   # bootstrap = node 1, creates config and heartbeat region; join = use existing config
+MODE="${3:-bootstrap}"   # bootstrap | heartbeat | register | join
 
 CLUSTER_CONFIG="/etc/ocfs2/cluster.conf"
 NODE_ID=$(hostname | sed 's/ocfs2-node-//g' || echo "1")
@@ -27,7 +27,7 @@ log_info "Настройка кластера OCFS2: $CLUSTER_NAME (режим: 
 
 # Создание конфигурации кластера только в режиме bootstrap (узел 1)
 if [ "$MODE" = "bootstrap" ]; then
-  log_info "Создание конфигурации кластера (только узлы, heartbeat добавим через o2cb)..."
+  log_info "Создание конфигурации кластера..."
   cat > "$CLUSTER_CONFIG" <<EOF
 cluster:
         node_count = $TOTAL_NODES
@@ -56,6 +56,18 @@ node:
 EOF
   done
   log_info "Конфигурация кластера создана: $CLUSTER_CONFIG"
+elif [ "$MODE" = "heartbeat" ]; then
+  log_info "Режим heartbeat: add-heartbeat на /dev/drbd0"
+  if [ ! -f "$CLUSTER_CONFIG" ]; then
+    log_error "Нет $CLUSTER_CONFIG — сначала bootstrap"
+    exit 1
+  fi
+elif [ "$MODE" = "register" ]; then
+  log_info "Режим register: cluster.conf уже есть, heartbeat не трогаем"
+  if [ ! -f "$CLUSTER_CONFIG" ]; then
+    log_error "Нет $CLUSTER_CONFIG"
+    exit 1
+  fi
 else
   log_info "Режим join: используем существующий $CLUSTER_CONFIG (не перезаписываем)"
   if [ ! -f "$CLUSTER_CONFIG" ] || ! grep -q "heartbeat:" "$CLUSTER_CONFIG"; then
@@ -79,7 +91,7 @@ modprobe ocfs2_dlmfs || true
 # Монтирование configfs
 log_info "Монтирование configfs..."
 mkdir -p /sys/kernel/config
-mount -t configfs none /sys/kernel/config || true
+mount -t configfs none /sys/kernel/config >/dev/null 2>&1 || true
 
 # Запуск o2cb
 log_info "Запуск o2cb..."
@@ -106,6 +118,22 @@ if [ "$MODE" = "bootstrap" ]; then
     o2cb unregister-cluster "$CLUSTER_NAME" >/dev/null 2>&1
   ) || true
   sleep 1
+elif [ "$MODE" = "heartbeat" ]; then
+  log_info "Сброс старых heartbeat-регионов перед add-heartbeat на /dev/drbd0..."
+  ( set +e
+    o2cb stop-heartbeat "$CLUSTER_NAME" >/dev/null 2>&1
+    o2cb list-heartbeats "$CLUSTER_NAME" 2>/dev/null | while IFS= read -r line; do
+      if echo "$line" | grep -q "region ="; then
+        hb_region=$(echo "$line" | grep -oP 'region = \K[^\s]+' || echo '')
+        [ -n "$hb_region" ] && o2cb remove-heartbeat "$CLUSTER_NAME" "$hb_region" >/dev/null 2>&1
+      fi
+    done
+    o2cb remove-heartbeat "$CLUSTER_NAME" /dev/drbd0 >/dev/null 2>&1
+    o2cb remove-heartbeat "$CLUSTER_NAME" /tmp/o2hb_region.img >/dev/null 2>&1
+  ) || true
+  sleep 1
+elif [ "$MODE" = "register" ]; then
+  :
 else
   log_info "Режим join: только остановка heartbeat (config не трогаем)..."
   ( set +e; o2cb stop-heartbeat "$CLUSTER_NAME" >/dev/null 2>&1 ) || true
@@ -116,8 +144,19 @@ fi
 log_info "Регистрация кластера..."
 o2cb register-cluster "$CLUSTER_NAME" || true
 
-# Heartbeat-регион создаёт только bootstrap (узел 1). В join — регион уже в config (скопирован с узла 1).
 if [ "$MODE" = "bootstrap" ]; then
+  log_info "cluster.conf записан, кластер зарегистрирован"
+  log_info "Кластер OCFS2 настроен"
+  exit 0
+fi
+
+if [ "$MODE" = "register" ]; then
+  log_info "Узел зарегистрирован"
+  log_info "Кластер OCFS2 настроен"
+  exit 0
+fi
+
+if [ "$MODE" = "heartbeat" ]; then
   DRBD_DEV="/dev/drbd0"
   for wait_attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -b "$DRBD_DEV" ]; then
@@ -131,64 +170,30 @@ if [ "$MODE" = "bootstrap" ]; then
     exit 1
   fi
 
-  # Сначала пробуем local heartbeat на /dev/drbd0
   o2cb heartbeat-mode local "$CLUSTER_NAME" >/dev/null 2>&1 || true
-  log_info "Стирание подписей ФС на $DRBD_DEV (wipefs)..."
-  wipefs -a "$DRBD_DEV" >/dev/null 2>&1 || true
-  sleep 1
-  log_info "Очистка начала $DRBD_DEV (512 MiB)..."
-  dd if=/dev/zero of="$DRBD_DEV" bs=1M count=512 >/dev/null 2>&1 || true
-  sleep 1
-  O2CB_ADD=""
+  O2CB_ADD="o2cb"
   for candidate in /usr/sbin/o2cb /usr/bin/o2cb o2cb; do
     if command -v "$candidate" >/dev/null 2>&1; then
       O2CB_ADD="$candidate"
       break
     fi
   done
-  [[ -z "$O2CB_ADD" ]] && O2CB_ADD="o2cb"
-  log_info "Создание heartbeat-региона на $DRBD_DEV (o2cb: $O2CB_ADD)..."
+  log_info "add-heartbeat $DRBD_DEV ($O2CB_ADD)..."
   add_ok=0
-  for attempt in 1 2 3; do
-    if "$O2CB_ADD" add-heartbeat "$CLUSTER_NAME" "$DRBD_DEV" 2>&1; then
+  for attempt in 1 2 3 4 5; do
+    if "$O2CB_ADD" add-heartbeat "$CLUSTER_NAME" "$DRBD_DEV" >/dev/null 2>&1; then
       add_ok=1
       break
     fi
-    log_warn "add-heartbeat на $DRBD_DEV попытка $attempt/3 не удалась, повтор через 3s..."
-    sleep 3
+    sleep 2
   done
-
-  # Обход "Unknown code ocfs 8": если add-heartbeat на drbd0 не удался — используем путь к файлу как регион (global mode).
-  # o2cb для не-блочного пути не вызывает ocfs2_open(), а использует путь как имя региона — ошибка ocfs 8 не возникает.
   if [ "$add_ok" -eq 0 ]; then
-    log_warn "add-heartbeat на $DRBD_DEV не удался (Unknown code ocfs 8). Используем путь к файлу как heartbeat-регион (global mode)..."
-    o2cb heartbeat-mode global "$CLUSTER_NAME" >/dev/null 2>&1 || true
-    HB_FILE="/tmp/o2hb_region.img"
-    log_info "Создание файла для heartbeat-региона: $HB_FILE (256 MiB)..."
-    rm -f "$HB_FILE" 2>/dev/null || true
-    dd if=/dev/zero of="$HB_FILE" bs=1M count=256 2>/dev/null || true
-    sync
-    log_info "Добавление heartbeat-региона по пути (не блочное устройство — o2cb не открывает через ocfs2_open): $HB_FILE"
-    add_ok=0
-    for attempt in 1 2 3; do
-      if "$O2CB_ADD" add-heartbeat "$CLUSTER_NAME" "$HB_FILE" 2>&1; then
-        add_ok=1
-        break
-      fi
-      log_warn "add-heartbeat по пути $HB_FILE попытка $attempt/3 не удалась, повтор через 2s..."
-      sleep 2
-    done
-  fi
-
-  if [ "$add_ok" -eq 0 ]; then
-    log_error "Не удалось добавить heartbeat-регион (ни на $DRBD_DEV, ни на loop-файл)"
+    log_error "Не удалось добавить heartbeat-регион на $DRBD_DEV"
     exit 1
   fi
-  sleep 2
+  sleep 1
   if ! grep -q "heartbeat:" "$CLUSTER_CONFIG"; then
     log_error "В $CLUSTER_CONFIG нет секции heartbeat после add-heartbeat"
-    log_error "Содержимое конфига:"
-    cat "$CLUSTER_CONFIG" || true
     exit 1
   fi
   log_info "Heartbeat-регион добавлен, секция heartbeat есть в $CLUSTER_CONFIG"

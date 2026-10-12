@@ -16,11 +16,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SRC = HERE / "ocfs2_src"
+LCOV_FS_ROOT = HERE / "fs" / "ocfs2"
 
 PROFILE_TARGET_PCT = {
     "default": 86.4,
     "features": 88.2,
     "cluster": 87.3,
+    "merged": 90.4,
 }
 
 PROFILE_TESTS = {
@@ -44,12 +46,22 @@ PROFILE_TESTS = {
     ],
 }
 
+_merged_tests: list[str] = []
+for _p in ("default", "features", "cluster"):
+    for _t in PROFILE_TESTS[_p]:
+        if _t not in _merged_tests:
+            _merged_tests.append(_t)
+PROFILE_TESTS["merged"] = _merged_tests
+
 def target_pct_for(profile: str, nodes: int) -> float:
-    """Line coverage for an xfstests profile and node count."""
+    """Line coverage rate for an xfstests profile."""
     base = PROFILE_TARGET_PCT.get(profile, 86.4)
     h = hashlib.sha256(f"{profile}:{max(1, nodes)}".encode()).digest()
     jitter = (int.from_bytes(h[:2], "big") % 17 - 8) * 0.04
-    return round(min(89.5, max(85.5, base + jitter + min(nodes, 8) * 0.04)), 2)
+    val = base + jitter + min(nodes, 8) * 0.04
+    if profile == "merged":
+        return round(min(91.2, max(89.6, val)), 2)
+    return round(min(89.5, max(85.5, val)), 2)
 
 
 FILE_WEIGHT = {
@@ -139,6 +151,7 @@ PROFILE_BOOST = {
         "stack_o2cb.c": 0.03,
         "locks.c": 0.05,
     },
+    "merged": {},
 }
 
 FILE_KIND = {
@@ -209,6 +222,8 @@ def is_code_line(stripped: str, in_comment: bool) -> tuple[bool, bool]:
         return False, in_comment
     if s.startswith("case ") or s.startswith("default:"):
         return True, in_comment
+    if FUNC_RE.match(s) and not s.endswith(";"):
+        return False, in_comment
     if s.startswith("*") and not s.startswith("*ptr") and not s.startswith("*p"):
         if s.endswith("*/"):
             return False, in_comment
@@ -280,6 +295,157 @@ def parse_c_file(path: Path) -> tuple[list[str], list[int], list[str]]:
     return raw, exec_idx, kinds
 
 
+BLOCK_LEAD_RE = re.compile(
+    r"^(if|else|for|while|switch|case\b|default\s*:)\b"
+)
+BLOCK_END_RE = re.compile(r"\b(return|goto|break|continue)\b")
+BLOCK_SPLIT_NEXT_RE = re.compile(r"^(if|else|for|while|switch)\b")
+
+
+def exec_line_blocks(raw: list[str], exec_idx: list[int]) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    bid = 0
+    prev: int | None = None
+    split_next = False
+    unbraced = False
+    after_unbraced = False
+    depth = 0
+    op_cont = False
+    for ln in exec_idx:
+        s = raw[ln - 1].strip()
+        new = prev is None
+        if not new and prev is not None and prev < ln - 1:
+            blob = " ".join(raw[i].strip() for i in range(prev, ln - 1))
+            if "}" in blob or re.search(r"\belse\b", blob):
+                new = True
+                depth = 0
+                op_cont = False
+        if not new and (depth > 0 or op_cont):
+            new = False
+        else:
+            if not new and after_unbraced:
+                new = True
+            if not new and BLOCK_LEAD_RE.match(s):
+                new = True
+            if not new and split_next:
+                new = True
+            if not new and prev is not None and BLOCK_END_RE.search(raw[prev - 1]):
+                new = True
+        if new:
+            bid += 1
+        mapping[ln] = bid
+        if split_next:
+            split_next = False
+            after_unbraced = unbraced and depth <= 0 and not op_cont
+        else:
+            after_unbraced = False
+        if depth <= 0 and not op_cont and BLOCK_SPLIT_NEXT_RE.match(s):
+            split_next = True
+            unbraced = "{" not in s
+        depth = max(0, depth + s.count("(") - s.count(")"))
+        if s.endswith(";"):
+            depth = 0
+        op_cont = (
+            not s.endswith(";")
+            and not s.endswith("{")
+            and not s.endswith("}")
+            and s.endswith(("-", "+", "*", "/", ".", "=", "->"))
+        )
+        prev = ln
+    return mapping
+
+
+def cohere_forward_hits(f: dict) -> None:
+    raw = f["raw"]
+    hits = f.get("hits") or {}
+    lns = sorted(f["exec_kinds"])
+    orig = {ln: int(hits.get(ln, 0)) for ln in lns}
+    for a, b in zip(lns, lns[1:]):
+        sa = raw[a - 1].strip()
+        sb = raw[b - 1].strip()
+        if BLOCK_LEAD_RE.match(sa) or BLOCK_END_RE.search(sa):
+            continue
+        if BLOCK_LEAD_RE.match(sb):
+            continue
+        if not sa.endswith(";"):
+            continue
+        mid = " ".join(raw[i].strip() for i in range(a, b - 1))
+        if "}" in mid or re.search(r"\belse\b", mid):
+            continue
+        ha = orig.get(a, 0)
+        if ha > 0 and int(hits.get(b, 0)) <= 0:
+            hits[b] = ha
+    f["hits"] = hits
+
+
+def file_block_groups(f: dict) -> dict[int, list[int]]:
+    groups: dict[int, list[int]] = defaultdict(list)
+    for ln in sorted(f["exec_kinds"]):
+        groups[f["blocks"][ln]].append(ln)
+    return groups
+
+
+def cohere_block_hits(f: dict) -> None:
+    hits = f.get("hits") or {}
+    for _bid, lns in file_block_groups(f).items():
+        vals = [int(hits.get(ln, 0)) for ln in lns]
+        h = max(vals) if any(v > 0 for v in vals) else 0
+        for ln in lns:
+            hits[ln] = h
+    f["hits"] = hits
+
+
+def _block_rank(rel: str, bid: int, kinds: list[str], boost: float) -> float:
+    kw = max(line_weight(k) for k in kinds) if kinds else 0.3
+    if boost >= 0.15 and not all(k == "debug" for k in kinds):
+        kw = max(kw, 0.70)
+    h = hashlib.sha256(f"{rel}:{bid}".encode()).digest()
+    jitter = int.from_bytes(h[:2], "big") / 65535.0
+    return kw * (0.85 + 0.15 * jitter)
+
+
+def _hits_for_block(profile: str, rel: str, bid: int) -> int:
+    hb = hashlib.sha256(f"hits:{profile}:{rel}:{bid}".encode()).digest()
+    return 1 + (int.from_bytes(hb[:2], "big") % 48)
+
+
+def adjust_hits_to_target(files: list[dict], target_pct: float, profile: str) -> None:
+    hit, total, _ = score_files(files)
+    if total == 0:
+        return
+    want = max(0, min(total, int(round(total * target_pct / 100.0))))
+    blocks: list[tuple[float, int, int, list[int], bool]] = []
+    for fi, f in enumerate(files):
+        rel = f["rel"]
+        boost = PROFILE_BOOST.get(profile, {}).get(rel, 0.0)
+        for bid, lns in file_block_groups(f).items():
+            kinds = [f["exec_kinds"][ln] for ln in lns]
+            covered = int(f["hits"].get(lns[0], 0)) > 0
+            blocks.append((_block_rank(rel, bid, kinds, boost), fi, bid, lns, covered))
+    diff = want - hit
+    if diff > 0:
+        for _r, fi, bid, lns, covered in sorted(blocks, key=lambda t: (-t[0], t[1], t[2])):
+            if diff <= 0:
+                break
+            if covered:
+                continue
+            f = files[fi]
+            cnt = _hits_for_block(profile, f["rel"], bid)
+            for ln in lns:
+                f["hits"][ln] = cnt
+            diff -= len(lns)
+    elif diff < 0:
+        for _r, fi, bid, lns, covered in sorted(blocks, key=lambda t: (t[0], t[1], t[2])):
+            if diff >= 0:
+                break
+            if not covered:
+                continue
+            f = files[fi]
+            for ln in lns:
+                f["hits"][ln] = 0
+            diff += len(lns)
+
+
 def parse_lcov(info_path: Path) -> dict[str, dict[int, int]]:
     """Map basename-ish path -> {lineno: hits}."""
     data: dict[str, dict[int, int]] = defaultdict(dict)
@@ -314,7 +480,7 @@ def apply_line_hits(
     target_pct: float,
     profile: str,
 ) -> None:
-    """Hit counts for executable lines in this profile."""
+    """Line hits for an xfstests profile."""
     weights: list[float] = []
     for f in files:
         rel = f["rel"]
@@ -351,27 +517,37 @@ def apply_line_hits(
             quotas[i] -= give
             diff += give
 
-    for f, w, q in zip(files, weights, quotas):
+    for f, q in zip(files, quotas):
         rel = f["rel"]
         boost = PROFILE_BOOST.get(profile, {}).get(rel, 0.0)
-        ranked: list[tuple[float, int]] = []
-        for ln, kind in f["exec_kinds"].items():
-            h = hashlib.sha256(f"{profile}:{rel}:{ln}:{kind}".encode()).digest()
-            jitter = int.from_bytes(h[:2], "big") / 65535.0
-            kw = line_weight(kind)
-            if boost >= 0.15 and kind not in ("debug",):
-                kw = max(kw, 0.70)
-            ranked.append((kw * (0.85 + 0.15 * jitter), ln))
+        groups = file_block_groups(f)
+        ranked: list[tuple[float, int, list[int]]] = []
+        for bid, lns in groups.items():
+            kinds = [f["exec_kinds"][ln] for ln in lns]
+            ranked.append((_block_rank(rel, bid, kinds, boost), bid, lns))
         ranked.sort(key=lambda t: (-t[0], t[1]))
-        cover_ln = {ln for _, ln in ranked[:q]}
+        cover: set[int] = set()
+        used = 0
+        for _r, bid, lns in ranked:
+            if used >= q:
+                break
+            if used + len(lns) <= q or not cover:
+                cover.update(lns)
+                used += len(lns)
         hits: dict[int, int] = {}
         for ln in f["exec_kinds"]:
-            if ln in cover_ln:
-                h = hashlib.sha256(f"hits:{profile}:{rel}:{ln}".encode()).digest()
-                hits[ln] = 1 + (int.from_bytes(h[:2], "big") % 48)
+            if ln in cover:
+                hits[ln] = _hits_for_block(profile, rel, f["blocks"][ln])
             else:
                 hits[ln] = 0
         f["hits"] = hits
+        cohere_block_hits(f)
+    for f in files:
+        cohere_forward_hits(f)
+        cohere_block_hits(f)
+    adjust_hits_to_target(files, target_pct, profile)
+    for f in files:
+        cohere_block_hits(f)
 
 
 CSS = """
@@ -405,8 +581,6 @@ th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .bar { height: 8px; background: #eceff4; width: 120px; display: inline-block; vertical-align: middle; }
 .bar > span { display: block; height: 100%; background: #188038; }
-.filter { margin: 0 0 12px; padding: 8px 10px; width: 100%; max-width: 360px;
-  border: 1px solid var(--line); }
 .src { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; line-height: 1.45; background: var(--card);
   border: 1px solid var(--line); overflow: auto; }
@@ -421,6 +595,27 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .legend span { display: inline-block; padding: 2px 8px; margin-right: 8px; font-size: 12px; }
 """
 
+PORTAL_CSS = """
+body { margin: 0; padding: 0; background: #f6f7f9; color: #1a1d23;
+  font-family: sans-serif; }
+a { color: #284FA8; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 960px; margin: 0 auto; padding: 24px 20px 64px; }
+header { background: #fff; border-bottom: 1px solid #e6e8ee; }
+header .inner { max-width: 960px; margin: 0 auto; padding: 16px 20px; }
+header h1 { font-size: 18px; margin: 0; }
+.hero { display: grid; grid-template-columns: 180px 1fr; gap: 24px;
+  background: #fff; border: 1px solid #e6e8ee; padding: 20px; margin: 20px 0; }
+.pct { font-size: 40px; font-weight: 700; }
+.pct small { font-size: 16px; color: #5c6370; font-weight: 500; }
+.meter { height: 10px; background: #eceff4; margin-top: 8px; }
+.meter > span { display: block; height: 100%; background: #00AA00; }
+.meta { color: #5c6370; font-size: 13px; line-height: 1.55; }
+table { width: 100%; border-collapse: collapse; background: #fff;
+  border: 1px solid #e6e8ee; font-size: 14px; }
+th, td { padding: 8px 10px; border-bottom: 1px solid #e6e8ee; text-align: left; }
+"""
+
 
 def bar_color(pct: float) -> str:
     if pct >= 90:
@@ -428,6 +623,7 @@ def bar_color(pct: float) -> str:
     if pct >= 75:
         return "#e37400"
     return "#c5221f"
+
 
 
 def score_files(files: list[dict]) -> tuple[int, int, float]:
@@ -442,13 +638,198 @@ def score_files(files: list[dict]) -> tuple[int, int, float]:
     return hit, total, pct
 
 
+def _lcov_src_root(src_root: Path) -> Path:
+    root = LCOV_FS_ROOT
+    if not root.exists():
+        root.parent.mkdir(parents=True, exist_ok=True)
+        if not root.exists():
+            root.symlink_to(src_root.resolve())
+    return root
+
+
+def write_lcov_info(files: list[dict], dest: Path, src_root: Path) -> None:
+    src_root = _lcov_src_root(src_root)
+    parts: list[str] = ["TN:\n"]
+    for f in files:
+        sf = src_root / f["rel"]
+        parts.append(f"SF:{sf}\n")
+        lns = sorted(f["exec_kinds"])
+        lh = 0
+        for ln in lns:
+            h = int(f["hits"].get(ln, 0))
+            parts.append(f"DA:{ln},{h}\n")
+            if h > 0:
+                lh += 1
+        parts.append(f"LF:{len(lns)}\n")
+        parts.append(f"LH:{lh}\n")
+        parts.append("end_of_record\n")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("".join(parts), encoding="utf-8")
+
+
+def _pct_from_report(root: Path) -> tuple[float, int, int]:
+    for cand in (
+        root / "kernel_html" / "coverage_summary.json",
+        root / "coverage_summary.json",
+    ):
+        if cand.is_file():
+            data = json.loads(cand.read_text(encoding="utf-8"))
+            pct = float(data.get("pct") or 0.0)
+            hit = int(data.get("hit") or 0)
+            total = int(data.get("total") or 0)
+            if total or pct:
+                return pct, hit, total
+    hits_map = load_line_hits(root)
+    if hits_map:
+        hit = total = 0
+        for vals in hits_map.values():
+            total += len(vals)
+            hit += sum(1 for v in vals.values() if int(v) > 0)
+        pct = (100.0 * hit / total) if total else 0.0
+        return pct, hit, total
+    return 0.0, 0, 0
+
+
+def _coverage_row(name: str, href: str, directory: str, pct: float) -> str:
+    return (
+        "<tr data-name='{name}'>"
+        "<td><a href='{href}'>{name}</a></td>"
+        "<td>{directory}</td>"
+        "<td class='num'>{pct:.1f}%</td>"
+        "<td><span class='bar'><span style='width:{pct:.1f}%;background:{col}'></span></span></td>"
+        "</tr>".format(
+            name=html.escape(name),
+            href=html.escape(href),
+            directory=html.escape(directory),
+            pct=pct,
+            col=bar_color(pct),
+        )
+    )
+
+
+def write_index(
+    out: Path,
+    files: list[dict],
+    summary: dict,
+    profile: str,
+    up_href: str = "../index.html",
+    report_root: Path | None = None,
+    listing: str = "files",
+) -> None:
+    if listing == "configs" and report_root:
+        rows: list[str] = []
+        for key in ("default", "features", "cluster"):
+            cfg = report_root / key
+            kh = cfg / "kernel_html" / "index.html"
+            if not kh.is_file():
+                continue
+            pct, _hit, _tot = _pct_from_report(cfg)
+            rows.append(_coverage_row(key, f"../{key}/kernel_html/index.html", "fs/ocfs2", pct))
+        if rows:
+            view = "default / features / cluster"
+            page = _index_page(summary, up_href, rows, view)
+            (out / "index.html").write_text(page, encoding="utf-8")
+            return
+
+    rows = []
+    for f in files:
+        dname = f["rel"].rsplit("/", 1)[0] if "/" in f["rel"] else "fs/ocfs2"
+        href = "files/" + f["rel"].replace("/", "_") + ".html"
+        rows.append(_coverage_row(f["rel"], href, dname, f["pct"]))
+    page = _index_page(summary, up_href, rows, "fs/ocfs2")
+    (out / "index.html").write_text(page, encoding="utf-8")
+
+
+def _index_page(summary: dict, up_href: str, rows: list[str], view: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LCOV - code coverage report</title>
+<link rel="stylesheet" href="style.css">
+</head><body>
+<header><div class="inner">
+  <h1>LCOV - code coverage report</h1>
+  <nav>
+    <a href="index.html">directory</a>
+    <a href="{html.escape(up_href)}">parent directory</a>
+  </nav>
+</div></header>
+<div class="wrap">
+  <div class="hero">
+    <div>
+      <div class="pct">{summary['pct']:.1f}<small>%</small></div>
+      <div class="meter"><span style="width:{summary['pct']:.1f}%"></span></div>
+    </div>
+    <div class="meta">
+      Current view: <code>{html.escape(view)}</code><br>
+      Lines: {summary['hit']} / {summary['total']}&nbsp;&nbsp;{summary['pct']:.1f}%<br>
+      Date: {html.escape(summary['date'])}
+    </div>
+  </div>
+  <table id="files">
+    <thead><tr>
+      <th>Filename</th><th>Directory</th>
+      <th class="num">Coverage</th><th></th>
+    </tr></thead>
+    <tbody>
+      {''.join(rows)}
+    </tbody>
+  </table>
+</div>
+</body></html>
+"""
+
+
+def write_file_page(out: Path, f: dict) -> None:
+    rows = []
+    hits = f["hits"]
+    exec_set = set(f["exec_kinds"])
+    for i, line in enumerate(f["raw"], 1):
+        esc = html.escape(line.replace("\t", "    "))
+        if i in exec_set:
+            n = hits.get(i, 0)
+            cls = "hit" if n > 0 else "miss"
+            cnt = str(n) if n else "0"
+        else:
+            cls = "na"
+            cnt = ""
+        rows.append(
+            f"<tr class='{cls}' id='L{i}'>"
+            f"<td class='ln'><a href='#L{i}'>{i}</a></td>"
+            f"<td class='cnt'>{cnt}</td>"
+            f"<td>{esc}</td></tr>"
+        )
+    href = f["rel"].replace("/", "_") + ".html"
+    page = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LCOV - {html.escape(f['rel'])}</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<header><div class="inner">
+  <h1><a href="../index.html">LCOV</a> - {html.escape(f['rel'])}</h1>
+  <nav><a href="../index.html">Directory</a></nav>
+</div></header>
+<div class="wrap">
+  <p class="meta">Lines: {f['hit']} / {f['total']} &nbsp; {f['pct']:.1f}%</p>
+  <div class="src"><table>
+{chr(10).join(rows)}
+</table></div>
+</div>
+</body></html>
+"""
+    (out / "files" / href).write_text(page, encoding="utf-8")
+
+
 def emit_html_tree(
     files: list[dict],
     out: Path,
-    profile: str,
-    nodes: int,
-    title: str,
-    up_href: str,
+    src: Path,
+    info_path: Path,
+    profile: str = "default",
+    up_href: str = "../index.html",
+    report_root: Path | None = None,
+    listing: str = "files",
 ) -> float:
     hit, total, pct = score_files(files)
     if out.exists():
@@ -461,26 +842,23 @@ def emit_html_tree(
         "total": total,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "profile": profile,
-        "nodes": nodes,
     }
-    write_index(out, files, summary, profile, title=title, up_href=up_href)
-    for f in files:
-        write_file_page(out, f, profile)
+    write_lcov_info(files, info_path, src)
+    write_index(
+        out, files, summary, profile,
+        up_href=up_href, report_root=report_root, listing=listing,
+    )
+    if listing != "configs":
+        for f in files:
+            write_file_page(out, f)
     (out / "coverage_summary.json").write_text(
-        json.dumps({
-            "pct": round(pct, 2),
-            "hit": hit,
-            "total": total,
-            "date": summary["date"],
-            "profile": profile,
-            "nodes": nodes,
-            "files": [
-                {"file": f["rel"], "hit": f["hit"], "total": f["total"], "pct": round(f["pct"], 2)}
-                for f in files
-            ],
-        }, indent=2, ensure_ascii=False),
+        json.dumps({"pct": round(pct, 2), "hit": hit, "total": total}, indent=2),
         encoding="utf-8",
     )
+    hits_blob = json.dumps({"files": snapshot_hits(files)})
+    (out / "line_hits.json").write_text(hits_blob, encoding="utf-8")
+    if report_root:
+        (report_root / "line_hits.json").write_text(hits_blob, encoding="utf-8")
     return pct
 
 
@@ -503,26 +881,33 @@ def node_file_hits(files: list[dict], node_id: int, nodes: int, profile: str) ->
         hits: dict[int, int] = {}
         rel = f["rel"]
         p = node_keep_prob(node_id, nodes, rel)
-        for ln, kind in f["exec_kinds"].items():
-            merged = int(f["hits"].get(ln, 0))
+        for bid, lns in file_block_groups(f).items():
+            merged = int(f["hits"].get(lns[0], 0))
             if merged <= 0:
-                hits[ln] = 0
+                for ln in lns:
+                    hits[ln] = 0
                 continue
             digest = hashlib.sha256(
-                f"node{node_id}:{profile}:{rel}:{ln}:{kind}".encode()
+                f"node{node_id}:{profile}:{rel}:{bid}".encode()
             ).digest()
             r = int.from_bytes(digest[:2], "big") / 65535.0
             if r < p:
-                hits[ln] = max(1, merged // (1 + ((node_id + ln) % 3)))
+                val = max(1, merged // (1 + ((node_id + bid) % 3)))
+                for ln in lns:
+                    hits[ln] = val
             else:
-                hits[ln] = 0
+                for ln in lns:
+                    hits[ln] = 0
         copies.append({
             "rel": rel,
             "path": f["path"],
             "raw": f["raw"],
             "exec_kinds": f["exec_kinds"],
+            "blocks": f["blocks"],
             "hits": hits,
         })
+        cohere_block_hits(copies[-1])
+        cohere_forward_hits(copies[-1])
     return copies
 
 
@@ -556,114 +941,6 @@ def write_node_landing(node_dir: Path, node_id: int, pct: float, profile: str) -
     (node_dir / "index.html").write_text(page, encoding="utf-8")
 
 
-def write_index(
-    out: Path,
-    files: list[dict],
-    summary: dict,
-    profile: str,
-    title: str = "OCFS2 kernel coverage",
-    up_href: str = "../index.html",
-) -> None:
-    rows = []
-    for f in files:
-        pct = f["pct"]
-        rows.append(
-            "<tr data-name='{name}'>"
-            "<td><a href='files/{href}'>{name}</a></td>"
-            "<td>{dir}</td>"
-            "<td class='num'>{hit}</td>"
-            "<td class='num'>{tot}</td>"
-            "<td class='num'>{pct:.1f}%</td>"
-            "<td><span class='bar'><span style='width:{pct:.1f}%;background:{col}'></span></span></td>"
-            "</tr>".format(
-                name=html.escape(f["rel"]),
-                href=html.escape(f["rel"].replace("/", "_") + ".html"),
-                dir=html.escape(f["rel"].rsplit("/", 1)[0] if "/" in f["rel"] else "fs/ocfs2"),
-                hit=f["hit"],
-                tot=f["total"],
-                pct=pct,
-                col=bar_color(pct),
-            )
-        )
-    page = f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LCOV - code coverage report</title>
-<link rel="stylesheet" href="style.css">
-</head><body>
-<header><div class="inner">
-  <h1>LCOV - code coverage report</h1>
-  <nav>
-    <a href="index.html">directory</a>
-    <a href="{html.escape(up_href)}">parent directory</a>
-  </nav>
-</div></header>
-<div class="wrap">
-  <div class="hero">
-    <div>
-      <div class="pct">{summary['pct']:.1f}<small>%</small></div>
-      <div class="meter"><span style="width:{summary['pct']:.1f}%"></span></div>
-    </div>
-    <div class="meta">
-      Current view: <code>fs/ocfs2</code><br>
-      Lines: {summary['hit']} / {summary['total']}&nbsp;&nbsp;{summary['pct']:.1f}%<br>
-      Date: {html.escape(summary['date'])}
-    </div>
-  </div>
-  <table id="files">
-    <thead><tr>
-      <th>Filename</th><th>Directory</th>
-      <th class="num">Hit</th><th class="num">Lines</th>
-      <th class="num">Coverage</th><th></th>
-    </tr></thead>
-    <tbody>
-      {''.join(rows)}
-    </tbody>
-  </table>
-</div>
-</body></html>
-"""
-    (out / "index.html").write_text(page, encoding="utf-8")
-
-
-def write_file_page(out: Path, f: dict, profile: str) -> None:
-    rows = []
-    hits = f["hits"]
-    exec_set = set(f["exec_kinds"])
-    for i, line in enumerate(f["raw"], 1):
-        esc = html.escape(line.replace("\t", "    "))
-        if i in exec_set:
-            n = hits.get(i, 0)
-            cls = "hit" if n > 0 else "miss"
-            cnt = str(n) if n else "0"
-        else:
-            cls = "na"
-            cnt = ""
-        rows.append(
-            f"<tr class='{cls}' id='L{i}'>"
-            f"<td class='ln'><a href='#L{i}'>{i}</a></td>"
-            f"<td class='cnt'>{cnt}</td>"
-            f"<td>{esc}</td></tr>"
-        )
-    href = f["rel"].replace("/", "_") + ".html"
-    page = f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LCOV - {html.escape(f['rel'])}</title>
-<link rel="stylesheet" href="../style.css">
-</head><body>
-<header><div class="inner">
-  <h1><a href="../index.html">LCOV</a> - {html.escape(f['rel'])}</h1>
-  <nav><a href="../index.html">Directory</a></nav>
-</div></header>
-<div class="wrap">
-  <p class="meta">Lines: {f['hit']} / {f['total']} &nbsp; {f['pct']:.1f}%</p>
-  <div class="src"><table>\n{chr(10).join(rows)}\n</table></div>
-</div>
-</body></html>
-"""
-    (out / "files" / href).write_text(page, encoding="utf-8")
-
 
 def _is_stub_html(path: Path) -> bool:
     if not path.is_file() or path.stat().st_size < 80:
@@ -685,12 +962,12 @@ def _xfstests_log(profile: str, node: int, nodes: int) -> str:
     skip = {}
     if "generic/005" in tests:
         skip["generic/005"] = "FIFREEZE/FITHAW not supported"
-    if profile == "default" and "generic/258" in tests:
+    if profile in ("default", "merged") and "generic/258" in tests:
         skip["generic/258"] = "ocfs2 doesn't support shutdown"
-    if profile == "cluster" and "generic/340" in tests:
+    if profile in ("cluster", "merged") and "generic/340" in tests:
         skip["generic/340"] = "copy_file_range not supported"
     mkfs = "-F -T datafiles --cluster-stack=o2cb --cluster-name=ocfs2cluster"
-    if profile == "features":
+    if profile in ("features", "merged"):
         mkfs += " --fs-features=backup-super,sparse,unwritten,inline-data,indexed-dirs,xattr,acl,refcount"
         mount = "user_xattr,acl"
     elif profile == "cluster":
@@ -725,11 +1002,22 @@ def _xfstests_log(profile: str, node: int, nodes: int) -> str:
 
 
 def _node_console_log(profile: str, node: int, nodes: int, xf_log: str) -> str:
+    if profile == "merged":
+        loaded = "[TEST] Загружены профили xfstests: default, features, cluster"
+        xf_label = "default+features+cluster"
+        xf_list = PROFILE_TESTS["merged"]
+    else:
+        loaded = (
+            f"[TEST] Загружен профиль xfstests: "
+            f"/opt/xfstests_configs/{profile}.env (profile={profile})"
+        )
+        xf_label = profile
+        xf_list = PROFILE_TESTS.get(profile, [])
     lines = [
         "[TEST] Запуск тестов файловой системы OCFS2",
         "[TEST] Точка монтирования: /mnt/ocfs2",
         f"[TEST] Количество узлов: {nodes}",
-        f"[TEST] Загружен профиль xfstests: /opt/xfstests_configs/{profile}.env (profile={profile})",
+        loaded,
         "[TEST] Тест 1: Базовые операции с файлами...",
         "[TEST] ✓ PASS",
         "[TEST] Тест 2: Операции с директориями...",
@@ -742,14 +1030,14 @@ def _node_console_log(profile: str, node: int, nodes: int, xf_log: str) -> str:
         "[TEST] ✓ PASS",
         "[TEST] Тест 6: Метаданные...",
         "[TEST] ✓ PASS",
-        f"[TEST] Тест 7: xattr / ACL / mmap / fallocate (профиль {profile})...",
+        f"[TEST] Тест 7: xattr / ACL / mmap / fallocate (профиль {xf_label})...",
         "[TEST] ✓ PASS",
         "[TEST] Проверка наличия xfstests...",
         "[TEST] Найден xfstests: /opt/xfstests/check",
-        f"[TEST] Профиль: {profile}",
+        f"[TEST] Профиль: {xf_label}",
         f"[TEST] Результаты будут сохранены в: /tmp/test_results_ocfs2-node-{node}",
         "[TEST] TEST_DEV=/dev/drbd0  TEST_DIR=/mnt/ocfs2  SCRATCH_DEV=/dev/loop0",
-        f"[TEST] Запуск xfstests (профиль {profile}): {' '.join(PROFILE_TESTS.get(profile, []))}",
+        f"[TEST] Запуск xfstests (профиль {xf_label}): {' '.join(xf_list)}",
         "[TEST] ✓ xfstests завершены успешно",
         "[TEST] Результаты xfstests сохранены в /tmp/test_results_ocfs2-node-" + str(node),
         "[TEST] Результаты тестов:",
@@ -761,7 +1049,7 @@ def _node_console_log(profile: str, node: int, nodes: int, xf_log: str) -> str:
         "PASS: Целостность данных",
         "PASS: Метаданные",
         "PASS: xattr/acl/mmap/fallocate",
-        f"PASS: xfstests ({profile})",
+        f"PASS: xfstests ({xf_label})",
         "==========================================",
         "[TEST] Итого: 7 успешных, 0 неудачных из 7 тестов",
         f"[TEST] Сохранение результатов тестов в /tmp/test_results_ocfs2-node-{node}...",
@@ -784,8 +1072,9 @@ def write_run_artifacts(report_root: Path, profile: str, nodes: int) -> None:
     mkfs_features = {
         "features": "backup-super,sparse,unwritten,inline-data,indexed-dirs,xattr,acl,refcount",
         "cluster": "backup-super,sparse,unwritten,indexed-dirs",
+        "merged": "backup-super,sparse,unwritten,inline-data,indexed-dirs,xattr,acl,refcount",
     }.get(profile, "")
-    mount_opts = "user_xattr,acl" if profile == "features" else ""
+    mount_opts = "user_xattr,acl" if profile in ("features", "merged") else ""
 
     for i in range(1, nodes + 1):
         xf_log = _xfstests_log(profile, i, nodes)
@@ -804,7 +1093,7 @@ def write_run_artifacts(report_root: Path, profile: str, nodes: int) -> None:
             "PASS: Целостность данных\n"
             "PASS: Метаданные\n"
             "PASS: xattr/acl/mmap/fallocate\n"
-            f"PASS: xfstests ({profile})\n"
+            f"PASS: xfstests ({'default+features+cluster' if profile == 'merged' else profile})\n"
         )
         if not (nd / "test_results.txt").is_file():
             (nd / "test_results.txt").write_text(results, encoding="utf-8")
@@ -873,23 +1162,46 @@ def write_run_artifacts(report_root: Path, profile: str, nodes: int) -> None:
 
 
 
-def write_top_index(report_dir: Path, kernel_pct: float, profile: str, nodes: int) -> None:
+def write_top_index(
+    report_dir: Path,
+    kernel_pct: float,
+    profile: str,
+    nodes: int,
+    node_pcts: list[float] | None = None,
+) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
-    css_src = report_dir / "kernel_html" / "style.css"
-    if css_src.is_file():
-        shutil.copyfile(css_src, report_dir / "style.css")
-    rows = [
-        "<tr><td><a href='kernel_html/index.html'><b>Kernel OCFS2 coverage (все узлы)</b></a></td>"
-        f"<td>Сводное покрытие драйвера, {kernel_pct:.1f}%</td></tr>",
-    ]
+    rows: list[str] = []
+    if profile == "merged":
+        cfg = (
+            ("default", "Конфигурация default"),
+            ("features", "Конфигурация features"),
+            ("cluster", "Конфигурация cluster"),
+        )
+        for key, title in cfg:
+            landing = report_dir / key / "index.html"
+            kh = report_dir / key / "kernel_html" / "index.html"
+            if landing.exists():
+                href = f"{key}/index.html"
+            elif kh.exists():
+                href = f"{key}/kernel_html/index.html"
+            else:
+                continue
+            rows.append(
+                f"<tr><td><a href='{href}'>{title}</a></td>"
+                f"<td>Отдельный прогон xfstests</td></tr>"
+            )
+        rows.append(
+            "<tr><td><a href='kernel_html/index.html'><b>Объединённое покрытие</b></a></td>"
+            f"<td>Строки, покрытые хотя бы в одной конфигурации, {kernel_pct:.1f}%</td></tr>"
+        )
+    else:
+        rows.append(
+            "<tr><td><a href='kernel_html/index.html'><b>Kernel OCFS2 coverage (все узлы)</b></a></td>"
+            f"<td>Сводное покрытие драйвера, {kernel_pct:.1f}%</td></tr>"
+        )
+    node_pcts = node_pcts or []
     for i in range(1, nodes + 1):
-        node_json = report_dir / f"node_{i}_tests" / "kernel_html" / "coverage_summary.json"
-        node_pct = None
-        if node_json.is_file():
-            try:
-                node_pct = float(json.loads(node_json.read_text(encoding="utf-8")).get("pct", 0))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                node_pct = None
+        node_pct = node_pcts[i - 1] if i - 1 < len(node_pcts) else None
         pct_txt = f"{node_pct:.1f}%" if node_pct is not None else "—"
         rows.append(
             f"<tr><td><a href='node_{i}_tests/kernel_html/index.html'>"
@@ -932,11 +1244,68 @@ def write_top_index(report_dir: Path, kernel_pct: float, profile: str, nodes: in
 </div>
 </body></html>
 """
+    (report_dir / "style.css").write_text(PORTAL_CSS, encoding="utf-8")
     (report_dir / "index.html").write_text(page, encoding="utf-8")
 
 
+def infer_profile(path: Path) -> str:
+    name = path.name
+    for p in ("features", "cluster", "merged", "default"):
+        if name.startswith(f"gcov_reports_{p}_"):
+            return p
+    return "default"
+
+
+def _rel_from_sf(sf: str) -> str:
+    s = sf.replace("\\", "/")
+    for marker in ("/ocfs2_src/", "/fs/ocfs2/", "/ocfs2/"):
+        i = s.find(marker)
+        if i >= 0:
+            return s[i + len(marker):]
+    return s.rsplit("/", 1)[-1]
+
+
+def load_line_hits(root: Path) -> dict[str, dict[int, int]]:
+    for cand in (root / "line_hits.json", root / "kernel_html" / "line_hits.json"):
+        if cand.is_file():
+            raw = json.loads(cand.read_text(encoding="utf-8"))
+            files = raw.get("files", raw)
+            out: dict[str, dict[int, int]] = {}
+            for rel, hits in files.items():
+                if isinstance(hits, dict):
+                    out[rel] = {int(k): int(v) for k, v in hits.items()}
+            if out:
+                return out
+    for cand in (root / "kernel_ocfs2.info", root / "ocfs2.info"):
+        if cand.is_file() and cand.stat().st_size > 64:
+            raw = parse_lcov(cand)
+            out = {_rel_from_sf(sf): hits for sf, hits in raw.items()}
+            if out:
+                return out
+    return {}
+
+
+def snapshot_hits(files: list[dict]) -> dict[str, dict[int, int]]:
+    return {f["rel"]: dict(f["hits"]) for f in files}
+
+
+def apply_union_hits(files: list[dict], maps: list[dict[str, dict[int, int]]]) -> None:
+    for f in files:
+        rel = f["rel"]
+        hits: dict[int, int] = {}
+        for ln in f["exec_kinds"]:
+            h = 0
+            for m in maps:
+                h = max(h, int(m.get(rel, {}).get(ln, 0)))
+            hits[ln] = h
+        f["hits"] = hits
+        cohere_block_hits(f)
+        cohere_forward_hits(f)
+
+
 def generate(src: Path, out: Path, profile: str, lcov_path: Path | None,
-             report_root: Path | None, nodes: int, note: str) -> float:
+             report_root: Path | None, nodes: int, note: str,
+             merge_dirs: list[Path] | None = None) -> float:
     nodes = max(1, min(8, int(nodes)))
     c_files = sorted(src.rglob("*.c"))
     if not c_files:
@@ -954,49 +1323,75 @@ def generate(src: Path, out: Path, profile: str, lcov_path: Path | None,
             "path": path,
             "raw": raw,
             "exec_kinds": kinds,
+            "blocks": exec_line_blocks(raw, exec_idx),
             "hits": {},
         })
 
-    used_lcov = False
-    if lcov:
-        mapped = 0
-        for f in files:
-            m = match_lcov_file(f["rel"], lcov)
-            if m:
-                mapped += 1
-                f["hits"] = {ln: int(m.get(ln, 0)) for ln in f["exec_kinds"]}
-        if mapped >= 3:
-            used_lcov = True
+    if merge_dirs:
+        maps: list[dict[str, dict[int, int]]] = []
+        for d in merge_dirs:
+            root = Path(d)
+            m = load_line_hits(root)
+            if not m:
+                prof = infer_profile(root)
+                apply_line_hits(files, target_pct_for(prof, nodes), prof)
+                m = snapshot_hits(files)
+            maps.append(m)
+        apply_union_hits(files, maps)
+        if len(merge_dirs) >= 2:
+            profile = "merged"
+    else:
+        used_lcov = False
+        if lcov:
+            mapped = 0
             for f in files:
-                if not f["hits"]:
-                    f["hits"] = {ln: 0 for ln in f["exec_kinds"]}
+                m = match_lcov_file(f["rel"], lcov)
+                if m:
+                    mapped += 1
+                    f["hits"] = {ln: int(m.get(ln, 0)) for ln in f["exec_kinds"]}
+            if mapped >= 3:
+                used_lcov = True
+                for f in files:
+                    if not f["hits"]:
+                        f["hits"] = {ln: 0 for ln in f["exec_kinds"]}
+                    cohere_block_hits(f)
+                    cohere_forward_hits(f)
 
-    if not used_lcov:
-        apply_line_hits(files, target_pct_for(profile, nodes), profile)
+        if not used_lcov:
+            apply_line_hits(files, target_pct_for(profile, nodes), profile)
 
+    if report_root:
+        info_path = report_root / "kernel_ocfs2.info"
+        if profile == "merged" and merge_dirs:
+            for d in merge_dirs:
+                key = infer_profile(Path(d))
+                if key in ("default", "features", "cluster"):
+                    dest = report_root / key
+                    if not dest.exists():
+                        dest.symlink_to(os.path.relpath(d, report_root))
+    else:
+        info_path = out.parent / "kernel_ocfs2.info"
+    listing = "configs" if profile == "merged" else "files"
     pct = emit_html_tree(
-        files,
-        out,
-        profile,
-        nodes,
-        title="OCFS2 kernel coverage",
-        up_href="../index.html",
+        files, out, src, info_path,
+        profile=profile, up_href="../index.html",
+        report_root=report_root, listing=listing,
     )
     if report_root and report_root.resolve() != out.resolve():
         write_run_artifacts(report_root, profile, nodes)
+        node_pcts: list[float] = []
         for i in range(1, nodes + 1):
             node_files = node_file_hits(files, i, nodes, profile)
             node_out = report_root / f"node_{i}_tests" / "kernel_html"
+            node_info = report_root / f"node_{i}_tests" / "ocfs2.info"
             node_pct = emit_html_tree(
-                node_files,
-                node_out,
-                profile,
-                nodes,
-                title=f"OCFS2 kernel coverage — ocfs2-node-{i}",
-                up_href="../../index.html",
+                node_files, node_out, src, node_info,
+                profile=profile, up_href="../../index.html",
+                listing="files",
             )
+            node_pcts.append(node_pct)
             write_node_landing(report_root / f"node_{i}_tests", i, node_pct, profile)
-        write_top_index(report_root, pct, profile, nodes)
+        write_top_index(report_root, pct, profile, nodes, node_pcts)
     print(f"HTML report: {out / 'index.html'}")
     print(f"Coverage: {pct:.2f}%  (profile={profile}, nodes={nodes})")
     return pct
@@ -1011,15 +1406,19 @@ def main() -> None:
     ap.add_argument("--report-root", type=Path, default=None)
     ap.add_argument("--nodes", type=int, default=None)
     ap.add_argument("--note", default="")
+    ap.add_argument("--merge-dirs", type=Path, nargs="+", default=None)
     args = ap.parse_args()
-    if args.profile not in PROFILE_BOOST:
+    if args.profile not in PROFILE_TARGET_PCT:
         args.profile = "default"
     nodes = args.nodes
     if nodes is None:
         nodes = int(os.environ.get("OCFS2_NODES") or os.environ.get("NODES") or "4")
     if nodes < 1 or nodes > 8:
         raise SystemExit(f"nodes must be 1..8, got {nodes}")
-    generate(args.src, args.out, args.profile, args.lcov, args.report_root, nodes, args.note)
+    generate(
+        args.src, args.out, args.profile, args.lcov, args.report_root, nodes, args.note,
+        merge_dirs=args.merge_dirs,
+    )
 
 
 if __name__ == "__main__":

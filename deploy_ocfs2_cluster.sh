@@ -9,6 +9,7 @@
 #   sudo ./deploy_ocfs2_cluster.sh 1          # 1 узел
 #   sudo ./deploy_ocfs2_cluster_2.sh 1        # профиль features (xattr/acl/refcount)
 #   sudo ./deploy_ocfs2_cluster_3.sh 2        # профиль cluster (DLM/locks, лучше N>=2)
+#   sudo ./deploy_ocfs2_all.sh 4              # все три профиля подряд, затем объединённое покрытие
 #   sudo ./deploy_ocfs2_cluster.sh cleanup
 #
 set -euo pipefail
@@ -650,6 +651,9 @@ generate_kernel_html_report() {
   if [[ -f "$report_dir/kernel_html/index.html" ]]; then
     local nfiles
     nfiles="$(find "$report_dir/kernel_html/files" -name '*.html' 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ -z "$nfiles" || "$nfiles" = 0 ]]; then
+      nfiles="$(find "$report_dir/kernel_html" -name '*.gcov.html' 2>/dev/null | wc -l | tr -d ' ')"
+    fi
     log_info "✓ Kernel HTML: $report_dir/kernel_html/index.html (файлов драйвера: $nfiles)"
     log_info "✓ Сводка отчёта: $report_dir/index.html"
     local i
